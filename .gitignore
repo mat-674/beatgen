@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+dataset/
+out/
+*.log
+nohup.out
+
+# input content — supply your own, never committed
+BeatmapLevelsData/
+
+# trained checkpoints: keep the small .pt so the app works after clone,
+# ignore everything else in the dir. Delete the '!' line to exclude weights.
+models/_ckpt/*
+!models/_ckpt/*.pt

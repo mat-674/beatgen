@@ -1,0 +1,10 @@
+# Normalize text line endings; keep scripts stable across OSes.
+* text=auto eol=lf
+*.bat text eol=crlf
+
+# Treat model/data artifacts as binary (no diff/merge, no eol munging).
+*.pt   binary
+*.npy  binary
+*.egg  binary
+*.ogg  binary
+*.wav  binary

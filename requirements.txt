@@ -1,0 +1,8 @@
+# Core deps (PyTorch is installed separately by install.py to pick CPU vs CUDA).
+# CPU:  pip install torch
+# CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu124
+numpy
+librosa
+soundfile
+UnityPy
+gradio
