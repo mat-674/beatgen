@@ -5,6 +5,7 @@ dataset/
 out/
 *.log
 nohup.out
+.claude/
 
 # input content — supply your own, never committed
 BeatmapLevelsData/
@@ -13,3 +14,7 @@ BeatmapLevelsData/
 # ignore everything else in the dir. Delete the '!' line to exclude weights.
 models/_ckpt/*
 !models/_ckpt/*.pt
+# runtime backups produced by models.common.save_with_backup and the .latest.pt
+# pointer — these regenerate on every training run, never commit them.
+models/_ckpt/*.bak-*.pt
+models/_ckpt/*.latest.pt

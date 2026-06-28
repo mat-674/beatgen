@@ -4,12 +4,14 @@ A GRU over the (short) action sequence. Per step it predicts, for red and blue:
 presence + lane x(4) + layer y(3) + cut direction d(9). Conditioned on local audio
 context, difficulty, and the previous emitted note (teacher forcing -> flow/parity).
 
-    python models/stage2.py --epochs 30
+    python models/stage2.py --epochs 30                                # train from scratch
+    python models/stage2.py --resume models/_ckpt/stage2.latest.pt    # fine-tune
 """
 from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -19,10 +21,13 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features.audio import N_MELS, time_to_frame  # noqa: E402
-from models.common import (MelCache, N_DIFF, list_beatmaps, load_canonical)  # noqa: E402
+from models.common import (MelCache, N_DIFF, list_beatmaps, load_canonical,  # noqa: E402
+                          save_with_backup)
 
 CKPT = Path("models/_ckpt/stage2.pt")
 NOTE_VEC = 2 * (1 + 4 + 3 + 9)   # per-note encoding width = 34
+CTX_RADIUS = 4                   # mel_context window half-width (frames, ~210 ms)
+CTX_DIM = 2 * N_MELS             # mel_context = concat(mean, max) over the window
 
 
 def encode_prev(red, blue) -> np.ndarray:
@@ -54,17 +59,29 @@ def actions_from_beatmap(notes):
     return acts
 
 
-def mel_context(mel: np.ndarray, frame: int, r: int = 1) -> np.ndarray:
-    a, b = max(0, frame - r), min(mel.shape[0], frame + r + 1)
-    return mel[a:b].mean(axis=0)
+def mel_context(mel: np.ndarray, frame: int, r: int = CTX_RADIUS) -> np.ndarray:
+    """Local audio summary around an action: concat(mean, max) over a +/-r window.
+
+    A plain mean over +/-1 frame gave the GRU almost no music to ground colour/position
+    on, so it leaned on the previous-note teacher forcing and collapsed (all one colour
+    / one column). A wider window plus a max channel restores real audio discrimination.
+    """
+    T = mel.shape[0]
+    if T == 0:
+        return np.zeros(2 * mel.shape[1], dtype=np.float32)
+    f = min(max(int(frame), 0), T - 1)               # clamp so the window is never empty
+    a, b = max(0, f - r), min(T, f + r + 1)
+    win = mel[a:b]
+    return np.concatenate([win.mean(axis=0), win.max(axis=0)]).astype(np.float32)
 
 
 class Stage2Net(nn.Module):
-    def __init__(self, n_mels=N_MELS, n_diff=N_DIFF, demb=16, hid=128):
+    def __init__(self, n_diff=N_DIFF, demb=16, hid=256, layers=2, ctx_dim=CTX_DIM):
         super().__init__()
         self.diff_emb = nn.Embedding(n_diff, demb)
-        self.ctx_proj = nn.Linear(n_mels, 64)
-        self.gru = nn.GRU(64 + demb + NOTE_VEC, hid, batch_first=True)
+        self.ctx_proj = nn.Linear(ctx_dim, 128)
+        self.gru = nn.GRU(128 + demb + NOTE_VEC, hid, num_layers=layers,
+                          batch_first=True, dropout=0.1 if layers > 1 else 0.0)
         # heads: for red & blue -> present(1)+x(4)+y(3)+d(9) = 17 each
         self.head = nn.Linear(hid, 2 * 17)
 
@@ -105,11 +122,12 @@ def build_sequences(beatmaps, cache):
     return seqs
 
 
-def seq_loss(out, tgt, device):
+def seq_loss(out, tgt, device, pos_weight=None):
     (rp, rx, ry, rd), (bp, bx, by, bd) = Stage2Net.split(out)
     t = torch.tensor(tgt, device=device)
-    loss = F.binary_cross_entropy_with_logits(rp, t[:, :, 0].float())
-    loss = loss + F.binary_cross_entropy_with_logits(bp, t[:, :, 4].float())
+    rw, bw = (pos_weight if pos_weight is not None else (None, None))
+    loss = F.binary_cross_entropy_with_logits(rp, t[:, :, 0].float(), pos_weight=rw)
+    loss = loss + F.binary_cross_entropy_with_logits(bp, t[:, :, 4].float(), pos_weight=bw)
 
     def ce(logits, ti, present):
         m = present.bool()
@@ -124,10 +142,14 @@ def seq_loss(out, tgt, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--data", type=Path, default=Path("dataset"))
+    ap.add_argument("--resume", type=Path, default=None,
+                    help="warm-start from a .pt (same dict format as save_with_backup)")
+    ap.add_argument("--out-dir", type=Path, default=CKPT.parent,
+                    help="where to write <name>.latest.pt and <name>.bak-<UTC>.pt")
     args = ap.parse_args()
     device = args.device
     rng = np.random.default_rng(0)
@@ -138,9 +160,38 @@ def main():
     cache = MelCache(); cache.fit_norm([b["mel_path"] for b in beatmaps])
     tr_seq = build_sequences(train, cache)
     va_seq = build_sequences(val, cache)
-    print(f"sequences: {len(tr_seq)} train / {len(va_seq)} val")
+    print(f"[stage2] sequences: {len(tr_seq)} train / {len(va_seq)} val", flush=True)
+
+    # colour balance -> per-colour pos_weight (mirrors Stage 1's onset pos_weight) +
+    # a column histogram, so a future "all blue / one column" collapse is visible in logs.
+    steps = sum(len(s["tgt"]) for s in tr_seq)
+    r_pos = sum(int(s["tgt"][:, 0].sum()) for s in tr_seq)
+    b_pos = sum(int(s["tgt"][:, 4].sum()) for s in tr_seq)
+    rpw = (steps - r_pos) / max(1, r_pos)
+    bpw = (steps - b_pos) / max(1, b_pos)
+    pos_weight = (torch.tensor(rpw, device=device), torch.tensor(bpw, device=device))
+    xr, xb = Counter(), Counter()
+    for s in tr_seq:
+        t = s["tgt"]
+        for row in t:
+            if row[0]:
+                xr[int(row[1])] += 1
+            if row[4]:
+                xb[int(row[5])] += 1
+    print(f"[stage2] colour balance: red {r_pos} / blue {b_pos} of {steps} steps | "
+          f"pos_w red {rpw:.1f} blue {bpw:.1f}", flush=True)
+    print(f"[stage2] x-hist red {dict(sorted(xr.items()))} | blue {dict(sorted(xb.items()))}",
+          flush=True)
 
     model = Stage2Net().to(device)
+    if args.resume is not None:
+        # weights_only=False: our own checkpoint format ({"model", "mean", "std"}),
+        # saved with save_with_backup. Trusted local file, not untrusted download.
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        cache.mean = float(ckpt.get("mean", cache.mean))
+        cache.std = float(ckpt.get("std", cache.std))
+        print(f"[stage2] resumed from {args.resume}", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     for ep in range(1, args.epochs + 1):
@@ -151,15 +202,20 @@ def main():
             prev = torch.tensor(s["prev"][None], device=device)
             diff = torch.tensor([s["diff"]], device=device)
             out, _ = model(ctx, diff, prev)
-            loss = seq_loss(out, s["tgt"][None], device)
+            loss = seq_loss(out, s["tgt"][None], device, pos_weight)
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item()
         if ep % 5 == 0 or ep == args.epochs:
             acc = eval_presence(model, va_seq, device)
-            print(f"ep {ep:3d} loss {tot/len(tr_seq):.4f} | val note-acc {acc:.3f}")
+            print(f"[stage2] ep {ep:3d} loss {tot/len(tr_seq):.4f} | val note-acc {acc:.3f}",
+                  flush=True)
+            latest = save_with_backup(
+                {"model": model.state_dict(), "mean": cache.mean, "std": cache.std},
+                args.out_dir, "stage2",
+            )
+            torch.save({"model": model.state_dict(), "mean": cache.mean, "std": cache.std}, CKPT)
+            print(f"[stage2] saved -> {latest}", flush=True)
 
-    CKPT.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": model.state_dict(), "mean": cache.mean, "std": cache.std}, CKPT)
-    print(f"saved -> {CKPT}")
+    print(f"[stage2] done -> {args.out_dir / 'stage2.latest.pt'}", flush=True)
 
 
 @torch.no_grad()

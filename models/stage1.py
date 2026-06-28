@@ -2,7 +2,8 @@
 
 CNN over mel + difficulty embedding -> BiGRU -> per-frame logit.
 
-    python models/stage1.py --epochs 40            # train
+    python models/stage1.py --epochs 40                              # train from scratch
+    python models/stage1.py --resume models/_ckpt/stage1.latest.pt  # fine-tune
 """
 from __future__ import annotations
 
@@ -17,7 +18,8 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features.audio import time_to_frame  # noqa: E402
 from features.audio import N_MELS  # noqa: E402
-from models.common import (MelCache, N_DIFF, list_beatmaps, load_canonical)  # noqa: E402
+from models.common import (MelCache, N_DIFF, list_beatmaps, load_canonical,  # noqa: E402
+                          save_with_backup)
 
 CROP = 1024
 CKPT = Path("models/_ckpt/stage1.pt")
@@ -41,7 +43,7 @@ class ResBlock(nn.Module):
 class Stage1Net(nn.Module):
     """TCN: per-frame onset logits from mel + difficulty embedding."""
 
-    def __init__(self, n_mels=N_MELS, n_diff=N_DIFF, demb=16, hid=128,
+    def __init__(self, n_mels=N_MELS, n_diff=N_DIFF, demb=16, hid=256,
                  dilations=(1, 2, 4, 8, 16, 32, 64)):
         super().__init__()
         self.diff_emb = nn.Embedding(n_diff, demb)
@@ -111,12 +113,16 @@ def evaluate(model, beatmaps, labels, cache, device, thr=0.5):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--steps", type=int, default=80)
     ap.add_argument("--bs", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--data", type=Path, default=Path("dataset"))
+    ap.add_argument("--resume", type=Path, default=None,
+                    help="warm-start from a .pt (same dict format as save_with_backup)")
+    ap.add_argument("--out-dir", type=Path, default=CKPT.parent,
+                    help="where to write <name>.latest.pt and <name>.bak-<UTC>.pt")
     args = ap.parse_args()
     device = args.device
     rng = np.random.default_rng(0)
@@ -131,9 +137,19 @@ def main():
     # global positive rate -> pos_weight
     pos = sum(l.sum() for l in labels.values()); tot = sum(l.size for l in labels.values())
     pos_w = float((tot - pos) / pos)
-    print(f"beatmaps: {len(train)} train / {len(val)} val | pos_rate={pos/tot:.4f} pos_weight={pos_w:.1f}")
+    print(f"[stage1] beatmaps: {len(train)} train / {len(val)} val | "
+          f"pos_rate={pos/tot:.4f} pos_weight={pos_w:.1f}", flush=True)
 
     model = Stage1Net().to(device)
+    if args.resume is not None:
+        # weights_only=False: our own checkpoint format ({"model", "mean", "std"}),
+        # saved with save_with_backup. Trusted local file, not untrusted download.
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        # keep the resumed mel-std in sync with the cache so the loss is comparable
+        cache.mean = float(ckpt.get("mean", cache.mean))
+        cache.std = float(ckpt.get("std", cache.std))
+        print(f"[stage1] resumed from {args.resume}", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     lossf = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_w, device=device))
 
@@ -147,11 +163,17 @@ def main():
             tot_loss += loss.item()
         if ep % 5 == 0 or ep == args.epochs:
             p, r, f1 = evaluate(model, val, labels, cache, device)
-            print(f"ep {ep:3d} loss {tot_loss/args.steps:.4f} | val P {p:.3f} R {r:.3f} F1 {f1:.3f}", flush=True)
-            CKPT.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[stage1] ep {ep:3d} loss {tot_loss/args.steps:.4f} | "
+                  f"val P {p:.3f} R {r:.3f} F1 {f1:.3f}", flush=True)
+            latest = save_with_backup(
+                {"model": model.state_dict(), "mean": cache.mean, "std": cache.std},
+                args.out_dir, "stage1",
+            )
+            # keep the legacy path up to date for back-compat with the inference loader
             torch.save({"model": model.state_dict(), "mean": cache.mean, "std": cache.std}, CKPT)
+            print(f"[stage1] saved -> {latest}", flush=True)
 
-    print(f"saved -> {CKPT}", flush=True)
+    print(f"[stage1] done -> {args.out_dir / 'stage1.latest.pt'}", flush=True)
 
 
 if __name__ == "__main__":

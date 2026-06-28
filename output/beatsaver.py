@@ -26,7 +26,8 @@ def write_audio_egg(samples, sr: int, dst: Path) -> bool:
     """Encode mono float32 samples -> Ogg Vorbis song.egg via CHUNKED streaming.
 
     libsndfile's vorbis encoder segfaults on a single bulk write of large arrays,
-    but streaming in ~1s blocks is stable.
+    but streaming in ~1s blocks is stable. Used only as a fallback when no original
+    source file is available (CLI without --write-audio src).
     """
     import numpy as np
     import soundfile as sf
@@ -37,34 +38,115 @@ def write_audio_egg(samples, sr: int, dst: Path) -> bool:
     return True
 
 
-def write_map(out_dir: Path, canon: dict, *, song_name: str, bpm: float,
-              difficulty: str = "Expert", audio=None, njs: float = 16.0):
-    """audio = (mono_float32_samples, sample_rate) or None."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    diff_file = f"{difficulty}Standard.dat"
-    (out_dir / diff_file).write_text(json.dumps(canonical_to_v2(canon)), encoding="utf-8")
+def write_song_egg(src: Path, dst: Path) -> bool:
+    """Write the ORIGINAL uploaded audio to song.egg at native SR + channels.
 
-    if audio is not None:
+    `.ogg`/`.egg` are copied byte-for-byte (lossless — Beat Saber reads ogg renamed
+    to .egg). Other formats are decoded at their native sample rate / channel layout
+    and re-encoded to Ogg Vorbis (chunked to dodge the libsndfile segfault). This is
+    what fixes the "shakal" audio: the old path wrote the 22.05 kHz mono *analysis*
+    signal instead of the real file.
+    """
+    import numpy as np
+    src = Path(src)
+    if src.suffix.lower() in (".ogg", ".egg"):
+        shutil.copy(src, dst)
+        return True
+
+    import soundfile as sf
+    try:
+        data, sr = sf.read(str(src), dtype="float32", always_2d=True)   # (frames, ch)
+    except Exception:
+        import librosa
+        y, sr = librosa.load(str(src), sr=None, mono=False)             # native SR, keep stereo
+        data = np.asarray(y, dtype="float32")
+        data = data.T if data.ndim == 2 else data[:, None]              # -> (frames, ch)
+    sr = int(sr)
+    ch = data.shape[1]
+    with sf.SoundFile(str(dst), "w", sr, ch, format="OGG", subtype="VORBIS") as f:
+        for i in range(0, len(data), sr):
+            f.write(data[i:i + sr])
+    return True
+
+
+def write_cover(src: Path, out_dir: Path) -> str:
+    """Copy/normalize a cover image into the map folder. Returns the filename used.
+
+    Prefers a centre-cropped square JPEG (Beat Saber wants square art) when Pillow is
+    available; otherwise copies the file as-is. Returns "" on failure.
+    """
+    src = Path(src)
+    try:
+        from PIL import Image
+        im = Image.open(src).convert("RGB")
+        w, h = im.size
+        s = min(w, h)
+        left, top = (w - s) // 2, (h - s) // 2
+        im = im.crop((left, top, left + s, top + s))
+        im.save(out_dir / "cover.jpg", "JPEG", quality=90)
+        return "cover.jpg"
+    except Exception:
+        try:
+            dst = out_dir / ("cover" + (src.suffix.lower() or ".jpg"))
+            shutil.copy(src, dst)
+            return dst.name
+        except Exception as e:
+            print(f"  [warn] cover copy failed: {e}")
+            return ""
+
+
+def write_map(out_dir: Path, beatmaps, *, song_name: str, bpm: float,
+              song_author: str = "Unknown", level_author: str = "beatgen-ai",
+              song_sub_name: str = "", audio_src=None, audio=None,
+              cover_src=None, njs: float = 16.0):
+    """Pack one or more difficulties into a single BeatSaver V2 level folder.
+
+    beatmaps : {difficulty_name: canon_dict}  (e.g. {"Expert": canon, "Hard": canon})
+    audio_src: path to the original audio file (preferred -> full quality song.egg).
+    audio    : (mono_float32_samples, sample_rate) fallback when no source file exists.
+    cover_src: path to a cover image, or None.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # one .dat per difficulty, ordered by rank
+    diff_beatmaps = []
+    for difficulty in sorted(beatmaps, key=lambda d: DIFF_RANK.get(d, 7)):
+        diff_file = f"{difficulty}Standard.dat"
+        (out_dir / diff_file).write_text(
+            json.dumps(canonical_to_v2(beatmaps[difficulty])), encoding="utf-8")
+        diff_beatmaps.append({
+            "_difficulty": difficulty, "_difficultyRank": DIFF_RANK.get(difficulty, 7),
+            "_beatmapFilename": diff_file, "_noteJumpMovementSpeed": njs,
+            "_noteJumpStartBeatOffset": 0, "_customData": {},
+        })
+
+    # audio: prefer the original file (native SR/stereo), fall back to raw samples
+    if audio_src is not None:
+        try:
+            write_song_egg(audio_src, out_dir / "song.egg")
+        except Exception as e:
+            print(f"  [warn] song.egg from source failed: {e}")
+            audio_src = None
+    if audio_src is None and audio is not None:
         try:
             write_audio_egg(audio[0], audio[1], out_dir / "song.egg")
         except Exception as e:
             print(f"  [warn] ogg encode failed: {e}")
 
+    cover_name = write_cover(cover_src, out_dir) if cover_src else ""
+
     info = {
-        "_version": "2.0.0", "_songName": song_name, "_songSubName": "",
-        "_songAuthorName": "Unknown", "_levelAuthorName": "beatgen-ai",
+        "_version": "2.0.0", "_songName": song_name, "_songSubName": song_sub_name,
+        "_songAuthorName": song_author, "_levelAuthorName": level_author,
         "_beatsPerMinute": round(float(bpm), 3), "_songTimeOffset": 0,
         "_shuffle": 0, "_shufflePeriod": 0.5, "_previewStartTime": 12,
         "_previewDuration": 10, "_songFilename": "song.egg",
-        "_coverImageFilename": "", "_environmentName": "DefaultEnvironment",
+        "_coverImageFilename": cover_name, "_environmentName": "DefaultEnvironment",
         "_allDirectionsEnvironmentName": "GlassDesertEnvironment",
         "_difficultyBeatmapSets": [{
             "_beatmapCharacteristicName": "Standard",
-            "_difficultyBeatmaps": [{
-                "_difficulty": difficulty, "_difficultyRank": DIFF_RANK.get(difficulty, 7),
-                "_beatmapFilename": diff_file, "_noteJumpMovementSpeed": njs,
-                "_noteJumpStartBeatOffset": 0, "_customData": {},
-            }],
+            "_difficultyBeatmaps": diff_beatmaps,
         }],
     }
     (out_dir / "Info.dat").write_text(json.dumps(info, indent=1), encoding="utf-8")

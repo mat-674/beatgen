@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+import shutil
+import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 DIFFICULTIES = ["Easy", "Normal", "Hard", "Expert", "ExpertPlus"]
 DIFF_IDX = {d: i for i, d in enumerate(DIFFICULTIES)}
@@ -63,3 +66,21 @@ class MelCache:
 
     def get(self, path: Path) -> np.ndarray:
         return ((self.get_raw(path) - self.mean) / self.std).astype(np.float32)
+
+
+def save_with_backup(state: dict, out_dir: Path, name: str) -> Path:
+    """Write <name>.latest.pt (overwrite) and <name>.bak-<UTC ts>.pt (unique copy).
+
+    The caller passes the same dict shape used elsewhere in the project:
+        {"model": state_dict, "mean": float|ndarray, "std": float|ndarray}
+    Returns the path to the latest file. Used by both training stages so the UI can
+    see a fresh checkpoint after every eval and also keep a timestamped history.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    latest = out_dir / f"{name}.latest.pt"
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    bak = out_dir / f"{name}.bak-{ts}.pt"
+    torch.save(state, latest)
+    shutil.copy2(latest, bak)
+    return latest
