@@ -8,6 +8,7 @@ CNN over mel + difficulty embedding -> BiGRU -> per-frame logit.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -66,7 +67,7 @@ def build_labels(beatmaps, cache):
     for bm in beatmaps:
         T = cache.get_raw(bm["mel_path"]).shape[0]
         lab = np.zeros(T, dtype=np.float32)
-        for n in load_canonical(bm["json_path"])["notes"]:
+        for n in load_canonical(str(bm["json_path"]))["notes"]:
             f = time_to_frame(float(n["t"]))
             if 0 <= f < T:
                 lab[f] = 1.0
@@ -125,20 +126,31 @@ def main():
                     help="where to write <name>.latest.pt and <name>.bak-<UTC>.pt")
     args = ap.parse_args()
     device = args.device
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng()
 
     beatmaps = list_beatmaps(args.data)
+    if not beatmaps:
+        print(f"[stage1] no beatmaps under {args.data.resolve()} — "
+              f"a song dir must contain mel.npy and at least one <Difficulty>.json. "
+              f"Build the dataset with: python extract/build_dataset.py BeatmapLevelsData --out dataset",
+              flush=True)
+        sys.exit(1)
     train = [b for b in beatmaps if not b["is_val"]]
     val = [b for b in beatmaps if b["is_val"]]
     cache = MelCache()
     cache.fit_norm([b["mel_path"] for b in beatmaps])
     labels = build_labels(beatmaps, cache)
 
-    # global positive rate -> pos_weight
+    # global positive rate -> pos_weight (with zero-guard for an empty/note-less dataset)
     pos = sum(l.sum() for l in labels.values()); tot = sum(l.size for l in labels.values())
-    pos_w = float((tot - pos) / pos)
+    if tot == 0 or pos == 0:
+        print(f"[stage1] WARNING: dataset has no notes (pos={pos}, tot={tot}). "
+              f"Falling back to pos_weight=1.0; the model will not learn.", flush=True)
+        pos_w = 1.0
+    else:
+        pos_w = float((tot - pos) / pos)
     print(f"[stage1] beatmaps: {len(train)} train / {len(val)} val | "
-          f"pos_rate={pos/tot:.4f} pos_weight={pos_w:.1f}", flush=True)
+          f"pos_rate={(pos/tot if tot else 0):.4f} pos_weight={pos_w:.1f}", flush=True)
 
     model = Stage1Net().to(device)
     if args.resume is not None:
@@ -147,8 +159,15 @@ def main():
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         # keep the resumed mel-std in sync with the cache so the loss is comparable
-        cache.mean = float(ckpt.get("mean", cache.mean))
-        cache.std = float(ckpt.get("std", cache.std))
+        old_mean = float(ckpt.get("mean", cache.mean))
+        old_std = float(ckpt.get("std", cache.std))
+        if (cache.mean and abs(old_mean - cache.mean) > 0.05 * abs(cache.mean)
+                or abs(old_std - cache.std) > 0.05 * abs(cache.std or 1.0)):
+            print(f"[stage1] WARNING: resume ckpt was fitted on a different dataset "
+                  f"(mean {old_mean:.4f} -> {cache.mean:.4f}, std {old_std:.4f} -> {cache.std:.4f}). "
+                  f"Loss will be miscalibrated until lr decays.", flush=True)
+        cache.mean = old_mean
+        cache.std = old_std
         print(f"[stage1] resumed from {args.resume}", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     lossf = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_w, device=device))
@@ -170,7 +189,10 @@ def main():
                 args.out_dir, "stage1",
             )
             # keep the legacy path up to date for back-compat with the inference loader
-            torch.save({"model": model.state_dict(), "mean": cache.mean, "std": cache.std}, CKPT)
+            ckpt_state = {"model": model.state_dict(), "mean": cache.mean, "std": cache.std}
+            tmp = CKPT.with_suffix(".tmp.pt")
+            torch.save(ckpt_state, tmp)
+            os.replace(tmp, CKPT)
             print(f"[stage1] saved -> {latest}", flush=True)
 
     print(f"[stage1] done -> {args.out_dir / 'stage1.latest.pt'}", flush=True)

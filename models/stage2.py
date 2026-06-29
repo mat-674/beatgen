@@ -10,6 +10,7 @@ context, difficulty, and the previous emitted note (teacher forcing -> flow/pari
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -25,21 +26,31 @@ from models.common import (MelCache, N_DIFF, list_beatmaps, load_canonical,  # n
                           save_with_backup)
 
 CKPT = Path("models/_ckpt/stage2.pt")
-NOTE_VEC = 2 * (1 + 4 + 3 + 9)   # per-note encoding width = 34
-CTX_RADIUS = 4                   # mel_context window half-width (frames, ~210 ms)
-CTX_DIM = 2 * N_MELS             # mel_context = concat(mean, max) over the window
+
+# Per-note encoding layout: one-hot presence + x(4) + y(3) + d(9) = 17 per hand.
+N_X, N_Y, N_D, N_PRESENT = 4, 3, 9, 1
+PER_NOTE_VEC = N_PRESENT + N_X + N_Y + N_D      # 17
+RED_OFFSET, BLUE_OFFSET = 0, PER_NOTE_VEC       # 0, 17
+NOTE_VEC = 2 * PER_NOTE_VEC                     # 34 (encoder width)
+CTX_RADIUS = 4                                  # mel_context window half-width (frames, ~210 ms)
+CTX_DIM = 2 * N_MELS                            # mel_context = concat(mean, max) over the window
+
+# Slice offsets inside one hand's PER_NOTE_VEC block, for readability at call sites.
+SLICE_X = slice(N_PRESENT, N_PRESENT + N_X)              # 1..5
+SLICE_Y = slice(N_PRESENT + N_X, N_PRESENT + N_X + N_Y)  # 5..8
+SLICE_D = slice(N_PRESENT + N_X + N_Y, PER_NOTE_VEC)     # 8..17
 
 
 def encode_prev(red, blue) -> np.ndarray:
     """red/blue = None or (x,y,d). -> 34-dim teacher-forcing vector."""
     v = np.zeros(NOTE_VEC, dtype=np.float32)
-    for off, note in ((0, red), (17, blue)):
+    for off, note in ((RED_OFFSET, red), (BLUE_OFFSET, blue)):
         if note is not None:
             x, y, d = note
             v[off] = 1.0
-            v[off + 1 + x] = 1.0
-            v[off + 5 + y] = 1.0
-            v[off + 8 + d] = 1.0
+            v[off + SLICE_X.start + x] = 1.0
+            v[off + SLICE_Y.start + y] = 1.0
+            v[off + SLICE_D.start + d] = 1.0
     return v
 
 
@@ -81,22 +92,21 @@ class Stage2Net(nn.Module):
         self.diff_emb = nn.Embedding(n_diff, demb)
         self.ctx_proj = nn.Linear(ctx_dim, 128)
         self.gru = nn.GRU(128 + demb + NOTE_VEC, hid, num_layers=layers,
-                          batch_first=True, dropout=0.1 if layers > 1 else 0.0)
-        # heads: for red & blue -> present(1)+x(4)+y(3)+d(9) = 17 each
-        self.head = nn.Linear(hid, 2 * 17)
+                          batch_first=True, dropout=0.1)
+        self.head = nn.Linear(hid, NOTE_VEC)
 
     def forward(self, ctx, diff, prev, h=None):
         # ctx:(B,L,M) diff:(B,) prev:(B,L,34)
         de = self.diff_emb(diff)[:, None, :].expand(-1, ctx.size(1), -1)
         x = torch.cat([torch.relu(self.ctx_proj(ctx)), de, prev], dim=-1)
         y, h = self.gru(x, h)
-        return self.head(y), h     # (B,L,34)
+        return self.head(y), h     # (B,L,NOTE_VEC)
 
     @staticmethod
     def split(out):
-        r, b = out[..., :17], out[..., 17:]
+        r, b = out[..., :PER_NOTE_VEC], out[..., PER_NOTE_VEC:]
         def parts(z):
-            return z[..., 0], z[..., 1:5], z[..., 5:8], z[..., 8:17]  # present,x,y,d
+            return z[..., 0], z[..., SLICE_X], z[..., SLICE_Y], z[..., SLICE_D]  # present,x,y,d
         return parts(r), parts(b)
 
 
@@ -104,7 +114,9 @@ def build_sequences(beatmaps, cache):
     seqs = []
     for bm in beatmaps:
         mel = cache.get(bm["mel_path"])
-        acts = actions_from_beatmap(load_canonical(bm["json_path"])["notes"])
+        acts = actions_from_beatmap(load_canonical(str(bm["json_path"]))["notes"])
+        # need at least 2 actions for the GRU to learn a transition; shorter sequences
+        # have no teacher-forcing history and would dilute the loss.
         if len(acts) < 2:
             continue
         ctx = np.stack([mel_context(mel, f) for f, _, _ in acts]).astype(np.float32)
@@ -140,6 +152,34 @@ def seq_loss(out, tgt, device, pos_weight=None):
     return loss
 
 
+@torch.no_grad()
+def eval_presence(model, seqs, device):
+    """Balanced accuracy over per-step present/absent predictions.
+
+    Returns a dict with `note_acc` (accuracy on present steps — the legacy metric)
+    and `bal_acc` (mean of present + absent accuracy — robust to class imbalance).
+    The `note_acc` field is kept for backward compatibility with the UI plot.
+    """
+    model.eval()
+    correct_p = total_p = correct_a = total_a = 0
+    for s in seqs:
+        ctx = torch.tensor(s["ctx"][None], device=device)
+        prev = torch.tensor(s["prev"][None], device=device)
+        diff = torch.tensor([s["diff"]], device=device)
+        out, _ = model(ctx, diff, prev)
+        (rp, _, _, _), (bp, _, _, _) = Stage2Net.split(out)
+        for logits, pres in ((rp, s["tgt"][:, 0]), (bp, s["tgt"][:, 4])):
+            pred = (torch.sigmoid(logits[0]) > 0.5).cpu().numpy()
+            truth = pres.astype(bool)
+            correct_p += int((pred & truth).sum())
+            total_p   += int(truth.sum())
+            correct_a += int((~pred & ~truth).sum())
+            total_a   += int((~truth).sum())
+    note_acc = correct_p / max(1, total_p)
+    bal_acc  = (correct_p / max(1, total_p) + correct_a / max(1, total_a)) / 2
+    return {"note_acc": note_acc, "bal_acc": bal_acc}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=60)
@@ -152,9 +192,15 @@ def main():
                     help="where to write <name>.latest.pt and <name>.bak-<UTC>.pt")
     args = ap.parse_args()
     device = args.device
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng()
 
     beatmaps = list_beatmaps(args.data)
+    if not beatmaps:
+        print(f"[stage2] no beatmaps under {args.data.resolve()} — "
+              f"a song dir must contain mel.npy and at least one <Difficulty>.json. "
+              f"Build the dataset with: python extract/build_dataset.py BeatmapLevelsData --out dataset",
+              flush=True)
+        sys.exit(1)
     train = [b for b in beatmaps if not b["is_val"]]
     val = [b for b in beatmaps if b["is_val"]]
     cache = MelCache(); cache.fit_norm([b["mel_path"] for b in beatmaps])
@@ -167,8 +213,13 @@ def main():
     steps = sum(len(s["tgt"]) for s in tr_seq)
     r_pos = sum(int(s["tgt"][:, 0].sum()) for s in tr_seq)
     b_pos = sum(int(s["tgt"][:, 4].sum()) for s in tr_seq)
-    rpw = (steps - r_pos) / max(1, r_pos)
-    bpw = (steps - b_pos) / max(1, b_pos)
+    if steps == 0 or (r_pos == 0 and b_pos == 0):
+        print(f"[stage2] WARNING: empty training set (steps={steps}, "
+              f"r_pos={r_pos}, b_pos={b_pos}). Falling back to pos_weight=1.0.", flush=True)
+        rpw = bpw = 1.0
+    else:
+        rpw = ((steps - r_pos) / r_pos) if r_pos else 1.0
+        bpw = ((steps - b_pos) / b_pos) if b_pos else 1.0
     pos_weight = (torch.tensor(rpw, device=device), torch.tensor(bpw, device=device))
     xr, xb = Counter(), Counter()
     for s in tr_seq:
@@ -189,8 +240,15 @@ def main():
         # saved with save_with_backup. Trusted local file, not untrusted download.
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
-        cache.mean = float(ckpt.get("mean", cache.mean))
-        cache.std = float(ckpt.get("std", cache.std))
+        old_mean = float(ckpt.get("mean", cache.mean))
+        old_std = float(ckpt.get("std", cache.std))
+        if (cache.mean and abs(old_mean - cache.mean) > 0.05 * abs(cache.mean)
+                or abs(old_std - cache.std) > 0.05 * abs(cache.std or 1.0)):
+            print(f"[stage2] WARNING: resume ckpt was fitted on a different dataset "
+                  f"(mean {old_mean:.4f} -> {cache.mean:.4f}, std {old_std:.4f} -> {cache.std:.4f}). "
+                  f"Loss will be miscalibrated until lr decays.", flush=True)
+        cache.mean = old_mean
+        cache.std = old_std
         print(f"[stage2] resumed from {args.resume}", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -206,35 +264,20 @@ def main():
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item()
         if ep % 5 == 0 or ep == args.epochs:
             acc = eval_presence(model, va_seq, device)
-            print(f"[stage2] ep {ep:3d} loss {tot/len(tr_seq):.4f} | val note-acc {acc:.3f}",
+            print(f"[stage2] ep {ep:3d} loss {tot/len(tr_seq):.4f} | "
+                  f"val note-acc {acc['note_acc']:.3f} bal-acc {acc['bal_acc']:.3f}",
                   flush=True)
             latest = save_with_backup(
                 {"model": model.state_dict(), "mean": cache.mean, "std": cache.std},
                 args.out_dir, "stage2",
             )
-            torch.save({"model": model.state_dict(), "mean": cache.mean, "std": cache.std}, CKPT)
+            ckpt_state = {"model": model.state_dict(), "mean": cache.mean, "std": cache.std}
+            tmp = CKPT.with_suffix(".tmp.pt")
+            torch.save(ckpt_state, tmp)
+            os.replace(tmp, CKPT)
             print(f"[stage2] saved -> {latest}", flush=True)
 
     print(f"[stage2] done -> {args.out_dir / 'stage2.latest.pt'}", flush=True)
-
-
-@torch.no_grad()
-def eval_presence(model, seqs, device):
-    model.eval(); correct = total = 0
-    for s in seqs:
-        ctx = torch.tensor(s["ctx"][None], device=device)
-        prev = torch.tensor(s["prev"][None], device=device)
-        diff = torch.tensor([s["diff"]], device=device)
-        out, _ = model(ctx, diff, prev)
-        (rp, rx, ry, rd), (bp, bx, by, bd) = Stage2Net.split(out)
-        t = s["tgt"]
-        for logits, ti, pres in ((rx, 1, t[:, 0]), (ry, 2, t[:, 0]), (rd, 3, t[:, 0]),
-                                 (bx, 5, t[:, 4]), (by, 6, t[:, 4]), (bd, 7, t[:, 4])):
-            m = pres.astype(bool)
-            if m.any():
-                pred = logits[0].argmax(-1).cpu().numpy()[m]
-                correct += int((pred == t[:, ti][m]).sum()); total += int(m.sum())
-    return correct / max(1, total)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,18 @@ from __future__ import annotations
 import shutil
 import sys
 import traceback
+import warnings
 from pathlib import Path
+
+# Gradio 5.x on a newer Starlette still emits this DeprecationWarning on every
+# queue-join request — harmless but floods the UI log with identical lines.
+# Silence the specific source until Gradio updates its symbol.
+warnings.filterwarnings(
+    "ignore",
+    message=r"HTTP_422_UNPROCESSABLE_ENTITY.*deprecated.*HTTP_422_UNPROCESSABLE_CONTENT",
+    category=DeprecationWarning,
+    module=r"gradio\.routes",
+)
 
 import gradio as gr
 import torch
@@ -122,13 +133,17 @@ def build():
                                 "(`python install.py --runtime cuda`) for GPU._")
             with gr.Tab("Train"):
                 handles = build_train_tab()
-                # Timer drives the live log + metrics while a training run is alive.
+                # Timer drives the live log + metrics + build status while a run is alive.
                 timer = gr.Timer(2.0, active=True)
                 def _tick():
                     s = refresh_handlers()
-                    return s["status_value"], s["log_value"], s["plot_value"], s["colour_value"]
-                timer.tick(_tick, outputs=[handles["status"], handles["log"],
-                                           handles["plot"], handles["colour"]])
+                    return (s["status_value"], s["log_value"], s["plot_value"],
+                            s["colour_value"],
+                            s["build_status_value"], s["build_log_value"])
+                timer.tick(_tick,
+                           outputs=[handles["status"], handles["log"],
+                                    handles["plot"], handles["colour"],
+                                    handles["build_status"], handles["build_log"]])
     return demo
 
 

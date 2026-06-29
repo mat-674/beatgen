@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -35,12 +37,19 @@ def list_beatmaps(data_dir: Path):
     return out
 
 
-def load_canonical(path: Path) -> dict:
+@lru_cache(maxsize=128)
+def load_canonical(path: str) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 class MelCache:
-    """Lazily load + globally standardize mel arrays, kept in memory."""
+    """Lazily load + globally standardize mel arrays, kept in memory.
+
+    FIFO eviction when the cache exceeds _MAX_MELS (~1-2 GB at typical mel sizes
+    on the 327-song dataset). Keeps memory bounded across long training runs.
+    """
+
+    _MAX_MELS = 512
 
     def __init__(self):
         self._mels: dict[str, np.ndarray] = {}
@@ -50,17 +59,29 @@ class MelCache:
     def get_raw(self, path: Path) -> np.ndarray:
         key = str(path)
         if key not in self._mels:
+            if len(self._mels) >= self._MAX_MELS:
+                self._mels.pop(next(iter(self._mels)))
             self._mels[key] = np.load(path)
         return self._mels[key]
 
     def fit_norm(self, paths):
-        acc, n = 0.0, 0
-        sq = 0.0
+        if not paths:
+            raise ValueError(
+                "MelCache.fit_norm: no beatmaps found. "
+                "Run `python extract/build_dataset.py BeatmapLevelsData --out dataset` "
+                "first, then pass --data dataset (not BeatmapLevelsData)."
+            )
+        acc, sq, n = 0.0, 0.0, 0
         for p in paths:
             m = self.get_raw(p)
             acc += m.sum(dtype=np.float64)
             sq += (m.astype(np.float64) ** 2).sum()
             n += m.size
+        if n == 0:
+            raise ValueError(
+                "MelCache.fit_norm: all mel arrays are empty (total size = 0). "
+                "The dataset folder exists but contains no usable mel.npy."
+            )
         self.mean = acc / n
         self.std = float(np.sqrt(sq / n - self.mean ** 2)) or 1.0
 
@@ -75,6 +96,10 @@ def save_with_backup(state: dict, out_dir: Path, name: str) -> Path:
         {"model": state_dict, "mean": float|ndarray, "std": float|ndarray}
     Returns the path to the latest file. Used by both training stages so the UI can
     see a fresh checkpoint after every eval and also keep a timestamped history.
+
+    Uses a hardlink for the backup (O(1) on the same filesystem, NTFS since 1809)
+    and falls back to a full copy on cloud-synced folders (OneDrive) where hardlinks
+    are rejected with OSError(1314).
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -82,5 +107,8 @@ def save_with_backup(state: dict, out_dir: Path, name: str) -> Path:
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     bak = out_dir / f"{name}.bak-{ts}.pt"
     torch.save(state, latest)
-    shutil.copy2(latest, bak)
+    try:
+        os.link(latest, bak)
+    except OSError:
+        shutil.copy2(latest, bak)
     return latest
