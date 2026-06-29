@@ -9,6 +9,8 @@ nohup.out
 
 # input content — supply your own, never committed
 BeatmapLevelsData/
+data/community_maps/
+data/community_maps/_index.sqlite
 
 # trained checkpoints: keep the small .pt so the app works after clone,
 # ignore everything else in the dir. Delete the '!' line to exclude weights.

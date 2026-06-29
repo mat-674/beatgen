@@ -13,6 +13,11 @@ uses a two-stage neural pipeline (the proven *Beat Sage / DanceDanceConvolution*
 Output is a standard **BeatSaver V2 map folder** (`Info.dat` + `<Difficulty>Standard.dat`
 + `song.egg`) that loads directly in Beat Saber or ChroMapper.
 
+By default the model is trained on the 326 in-tree OST/DLC levels. To scale further,
+the community fetcher (`scripts/fetch_community_maps.py`) downloads ranked BeatLeader
+maps straight into `data/community_maps/` and `extract/build_dataset.py` picks them up
+alongside the OST — see [§5. Community training data](#5-community-training-data).
+
 ---
 
 ## 1. Requirements
@@ -77,7 +82,58 @@ Three steps turn raw content into trained models. Run them in order:
 Both stages default to **60 epochs** (up from the 65-song proof-of-life) to make use of the
 larger 326-song set; lower them for a quick smoke test.
 
-The dataset builder is **omnivorous and recursive** — it walks every subfolder and detects:
+---
+
+## 5. Community training data
+
+The 326 OST/DLC levels are a strong baseline, but BeatLeader's ranked pool has ~3.9k
+high-quality Standard maps that are independently reviewed and played by tens of thousands
+of players — exactly the kind of "in the wild" signal the model is missing. The
+`scripts/fetch_community_maps.py` script pulls those maps straight from BeatLeader
+(`GET /leaderboards?type=ranked&sortBy=playCount`) and unpacks them into
+`data/community_maps/` in the same `Info.dat + *.dat + song.egg` layout that
+`extract/build_dataset.py` already knows how to eat — no training code changes required.
+
+```bash
+# 1) Fetch up to 5 000 ranked Standard maps (default sort: by playCount, strongest signal).
+.venv\Scripts\python.exe scripts/fetch_community_maps.py --max-songs 5000
+
+# 1a) Other useful knobs:
+#     --types ranked,qualified            # include qualified too
+#     --min-stars 2                       # drop unrated / very-easy maps
+#     --rate 50                           # BL budget: 50 req / 10 s
+#     --resume                            # pick up where you left off (default: on)
+#     --out data/community_maps           # where the maps land (default)
+#     --log-level DEBUG                   # for network issues
+
+# 2) Build the dataset from BOTH the OST bundles and the community maps.
+.venv\Scripts\python.exe extract/build_dataset.py data\community_maps BeatmapLevelsData
+
+# 3) Train as usual — Stage 1 / Stage 2 see ~5 000 + 326 songs automatically.
+.venv\Scripts\python.exe models\stage1.py --epochs 60
+.venv\Scripts\python.exe models\stage2.py --epochs 60
+```
+
+What the fetcher does and does *not* do:
+
+- **Does** download only `mode == Standard` rows from BL's ranked pool.
+- **Does** drop songs outside `[60, 600] s` / `[60, 250] bpm` and difficulties with
+  fewer than 30 notes.
+- **Does** soft-dedup by `(normalized artist|title, duration±2 s)` so a song uploaded by
+  multiple mappers only contributes one training sample.
+- **Does** write a SQLite manifest at `data/community_maps/_index.sqlite` so `--resume`
+  skips anything already on disk.
+- **Does NOT** talk to api.beatsaver.com — BL's `song.downloadUrl` is the same BeatSaver
+  CDN zip, so we hit one API end-to-end.
+- **Does NOT** modify any training code. Add `data\community_maps` to your
+  `build_dataset.py` invocation and you're done.
+
+The expected wall-clock for the full 5 000-song run is ~1.5–2 hours on a typical
+home connection (5 songs / 6 s in the smoke test, 30 % headroom for the slower pages).
+
+---
+
+
 - **Unity asset bundles** by magic bytes (any/no extension) — the official OST/DLC.
 - **standard BeatSaver map folders** (`Info.dat` + `.dat` + `.ogg/.egg`) — community maps.
 
