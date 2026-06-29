@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from collections import Counter
 from pathlib import Path
@@ -252,6 +253,12 @@ def main():
         print(f"[stage2] resumed from {args.resume}", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    # Track the best balanced-accuracy checkpoint and stop early when it stops
+    # improving — see stage1.py for the rationale.
+    best_bal = -1.0
+    EARLY_STOP_PATIENCE_EVALS = 3
+    no_improve = 0
+
     for ep in range(1, args.epochs + 1):
         model.train(); order = rng.permutation(len(tr_seq)); tot = 0.0
         for i in order:
@@ -264,20 +271,41 @@ def main():
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item()
         if ep % 5 == 0 or ep == args.epochs:
             acc = eval_presence(model, va_seq, device)
+            bal = acc["bal_acc"]
+            if bal > best_bal:
+                best_bal = bal
+                no_improve = 0
+                best_path = args.out_dir / "stage2.best.pt"
+                tmp = best_path.with_suffix(".tmp.pt")
+                torch.save({"model": model.state_dict(),
+                            "mean": cache.mean, "std": cache.std}, tmp)
+                os.replace(tmp, best_path)
+                best_tag = f" best bal-acc {bal:.3f} -> {best_path}"
+                # Mirror best -> legacy stage2.pt so hardcoded-path callers
+                # load the validated-best model instead of the latest one
+                # (which is just the last-epoch weights and may be overfit).
+                shutil.copy2(best_path, CKPT)
+            else:
+                no_improve += 1
+                best_tag = f" (best bal-acc {best_bal:.3f}, no improve {no_improve}/{EARLY_STOP_PATIENCE_EVALS})"
+                if no_improve >= EARLY_STOP_PATIENCE_EVALS:
+                    print(f"[stage2] ep {ep:3d} loss {tot/len(tr_seq):.4f} | "
+                          f"val note-acc {acc['note_acc']:.3f} bal-acc {bal:.3f}{best_tag}",
+                          flush=True)
+                    print(f"[stage2] early stop: no bal-acc improvement for "
+                          f"{EARLY_STOP_PATIENCE_EVALS * 5} epochs", flush=True)
+                    break
             print(f"[stage2] ep {ep:3d} loss {tot/len(tr_seq):.4f} | "
-                  f"val note-acc {acc['note_acc']:.3f} bal-acc {acc['bal_acc']:.3f}",
+                  f"val note-acc {acc['note_acc']:.3f} bal-acc {bal:.3f}{best_tag}",
                   flush=True)
             latest = save_with_backup(
                 {"model": model.state_dict(), "mean": cache.mean, "std": cache.std},
                 args.out_dir, "stage2",
             )
-            ckpt_state = {"model": model.state_dict(), "mean": cache.mean, "std": cache.std}
-            tmp = CKPT.with_suffix(".tmp.pt")
-            torch.save(ckpt_state, tmp)
-            os.replace(tmp, CKPT)
             print(f"[stage2] saved -> {latest}", flush=True)
 
-    print(f"[stage2] done -> {args.out_dir / 'stage2.latest.pt'}", flush=True)
+    print(f"[stage2] done -> {args.out_dir / 'stage2.latest.pt'} "
+          f"(best bal-acc {best_bal:.3f} -> {args.out_dir / 'stage2.best.pt'})", flush=True)
 
 
 if __name__ == "__main__":

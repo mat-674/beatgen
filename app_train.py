@@ -58,6 +58,10 @@ RE_STAGE2_XHIST = re.compile(
 )
 RE_SAVE = re.compile(r"\[(stage\d)\]\s+saved\s+->\s+(.+)")
 RE_RESUME = re.compile(r"\[(stage\d)\]\s+resumed\s+from\s+(.+)")
+# Best checkpoint line printed only when a new F1/bal-acc record is set
+# (see stage1.py / stage2.py). Captures the metric name + value + path so the
+# UI can surface it next to `latest`.
+RE_BEST = re.compile(r"\[(stage\d)\]\s+.*?\bbest\s+(\S+)\s+([\d.]+)\s+->\s+(.+)$")
 
 RE_BUILD_OK = re.compile(r"^\[ok\]\s+(\S+)\s+bpm=([\d.]+).*notes=(\d+)")
 RE_BUILD_FAIL = re.compile(r"^\[(FAIL|empty)\]\s+(\S+)")
@@ -85,7 +89,8 @@ class TrainRunner:
     log: list[str] = field(default_factory=list)
     metrics: list[dict] = field(default_factory=list)
     colour: dict | None = None
-    last_ckpt: str = ""
+    last_ckpt: str = ""        # most recent `.latest.pt` (may have overfit)
+    last_best: dict | None = None   # {"metric": "F1", "value": 0.56, "path": "..."} from `best F1 0.56 -> ...`
     status: str = "idle"   # idle | running | done | failed | stopped
     was_stopped: bool = False  # set by stop() so _finalize can distinguish user-Stop from a crash
     _reader: threading.Thread | None = None
@@ -105,6 +110,7 @@ class TrainRunner:
             self.metrics = []
             self.colour = None
             self.last_ckpt = ""
+            self.last_best = None
             self.status = "running"
         cmd = [sys.executable, "-u", str(ROOT / "models" / f"{stage}.py"), *args]
         # -u so the child flushes stdout line-by-line into our pipe.
@@ -172,6 +178,11 @@ class TrainRunner:
         if m:
             self.last_ckpt = m.group(2).strip()
             return
+        m = RE_BEST.search(line)
+        if m:
+            self.last_best = {"metric": m.group(2), "value": float(m.group(3)),
+                              "path": m.group(4).strip()}
+            return
         m = RE_RESUME.search(line)
         if m:
             self.log.append(f"[ui] (warm-start from {m.group(2).strip()})")
@@ -206,6 +217,7 @@ class TrainRunner:
             return {"status": self.status, "stage": self.stage,
                     "log_tail": self.log[-50:], "metrics": list(self.metrics),
                     "colour": self.colour, "last_ckpt": self.last_ckpt,
+                    "last_best": self.last_best,
                     "running": self.is_running()}
 
 
@@ -513,11 +525,17 @@ def _format_status(snap: dict) -> str:
     status = snap["status"]
     stage = snap["stage"] or "—"
     ckpt = snap["last_ckpt"]
+    best = snap.get("last_best")
     running = f"### 🟡 Running `{stage}`"
     done = f"### ✅ Done (`{stage}`)"
     failed = f"### ❌ Failed (`{stage}`)"
     stopped = f"### ⏹ Stopped (`{stage}`)"
-    footer = f"**Latest checkpoint:** `{ckpt}`" if ckpt else ""
+    footers = []
+    if ckpt:
+        footers.append(f"**Latest checkpoint:** `{ckpt}`")
+    if best:
+        footers.append(f"**Best {best['metric']} {best['value']:.3f}:** `{best['path']}`")
+    footer = "\n".join(footers)
     if status == "stopped":
         return stopped + (("\n" + footer) if footer else "")
     return _format_status_block(

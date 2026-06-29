@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -172,6 +173,19 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     lossf = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_w, device=device))
 
+    # Track the best F1 we have seen so we can save a stable `stage1.best.pt`
+    # (the .latest.pt checkpoint always reflects the last epoch, which may have
+    # overfit and be worse than an earlier one — `best.pt` is what inference
+    # should actually load).
+    best_f1 = -1.0
+    # Patience for early stop: how many consecutive evals (each eval = every 5
+    # epochs) we allow without improvement before bailing. 3 evals = 15 epochs
+    # of grace, long enough to ride out the noisy plateau before F1 finally
+    # ticks up again (see train_stage1.log: F1 was flat for ~25 epochs before
+    # resuming growth).
+    EARLY_STOP_PATIENCE_EVALS = 3
+    no_improve = 0
+
     for ep in range(1, args.epochs + 1):
         model.train(); tot_loss = 0.0
         for _ in range(args.steps):
@@ -182,20 +196,40 @@ def main():
             tot_loss += loss.item()
         if ep % 5 == 0 or ep == args.epochs:
             p, r, f1 = evaluate(model, val, labels, cache, device)
+            # best.pt: only overwrite on strict improvement so it never regresses.
+            if f1 > best_f1:
+                best_f1 = f1
+                no_improve = 0
+                best_path = args.out_dir / "stage1.best.pt"
+                tmp = best_path.with_suffix(".tmp.pt")
+                torch.save({"model": model.state_dict(),
+                            "mean": cache.mean, "std": cache.std}, tmp)
+                os.replace(tmp, best_path)
+                best_tag = f" best F1 {f1:.3f} -> {best_path}"
+                # Mirror best -> legacy stage1.pt so callers that hardcode that
+                # path load the validated-best weights, not the latest-epoch
+                # ones (which may be overfit and worse). Cheap: copy not save.
+                shutil.copy2(best_path, CKPT)
+            else:
+                no_improve += 1
+                best_tag = f" (best F1 {best_f1:.3f}, no improve {no_improve}/{EARLY_STOP_PATIENCE_EVALS})"
+                if no_improve >= EARLY_STOP_PATIENCE_EVALS:
+                    print(f"[stage1] ep {ep:3d} loss {tot_loss/args.steps:.4f} | "
+                          f"val P {p:.3f} R {r:.3f} F1 {f1:.3f}{best_tag}",
+                          flush=True)
+                    print(f"[stage1] early stop: no F1 improvement for "
+                          f"{EARLY_STOP_PATIENCE_EVALS * 5} epochs", flush=True)
+                    break
             print(f"[stage1] ep {ep:3d} loss {tot_loss/args.steps:.4f} | "
-                  f"val P {p:.3f} R {r:.3f} F1 {f1:.3f}", flush=True)
+                  f"val P {p:.3f} R {r:.3f} F1 {f1:.3f}{best_tag}", flush=True)
             latest = save_with_backup(
                 {"model": model.state_dict(), "mean": cache.mean, "std": cache.std},
                 args.out_dir, "stage1",
             )
-            # keep the legacy path up to date for back-compat with the inference loader
-            ckpt_state = {"model": model.state_dict(), "mean": cache.mean, "std": cache.std}
-            tmp = CKPT.with_suffix(".tmp.pt")
-            torch.save(ckpt_state, tmp)
-            os.replace(tmp, CKPT)
             print(f"[stage1] saved -> {latest}", flush=True)
 
-    print(f"[stage1] done -> {args.out_dir / 'stage1.latest.pt'}", flush=True)
+    print(f"[stage1] done -> {args.out_dir / 'stage1.latest.pt'} "
+          f"(best F1 {best_f1:.3f} -> {args.out_dir / 'stage1.best.pt'})", flush=True)
 
 
 if __name__ == "__main__":

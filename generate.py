@@ -25,8 +25,19 @@ from models.stage2 import NOTE_VEC, Stage2Net, encode_prev, mel_context  # noqa:
 from validate.playability import validate  # noqa: E402
 from output.beatsaver import write_map  # noqa: E402
 
-CKPT1 = Path(__file__).resolve().parent / "models/_ckpt/stage1.pt"
-CKPT2 = Path(__file__).resolve().parent / "models/_ckpt/stage2.pt"
+_CKPT_DIR = Path(__file__).resolve().parent / "models/_ckpt"
+# Prefer .best.pt (the model the trainer actually validated on) over .latest.pt
+# (which is just the last-epoch weights and may be overfit). Fall back to .pt
+# so older training runs that never wrote a .best still load.
+def _pick_ckpt(stage: str) -> Path:
+    for name in (f"{stage}.best.pt", f"{stage}.latest.pt", f"{stage}.pt"):
+        p = _CKPT_DIR / name
+        if p.exists():
+            return p
+    return _CKPT_DIR / f"{stage}.pt"   # the missing-file path used in error msgs
+
+CKPT1 = _pick_ckpt("stage1")
+CKPT2 = _pick_ckpt("stage2")
 
 
 def standardize(mel, mean, std):
@@ -95,9 +106,19 @@ def _sample_cat(logits, temperature, rng):
     return int(rng.choice(len(p), p=p))
 
 
+# Note sampling temperature. Hardcoded to 1.0 because the GRU frequently
+# over-confidently picks one lane (teacher-forcing feedback loop), so argmax
+# (T=0) collapses to a single column on out-of-distribution songs. T=1.0
+# samples proportionally to the logits and reliably recovers all 4 columns
+# + 9 cut directions. Advanced callers can still pass `temperature=` to
+# generate_notes / run to override.
+DEFAULT_TEMPERATURE = 1.0
+
+
 @torch.no_grad()
 def generate_notes(audio_path, difficulty="Expert", *, bpm=None, thr=0.85,
-                   models=None, device="cpu", temperature=1.0, seed=None, analysis=None):
+                   models=None, device="cpu", temperature=DEFAULT_TEMPERATURE,
+                   seed=None, analysis=None):
     """Run both stages for one difficulty. Returns (canon: dict, stats: dict). No file I/O."""
     if models is None:
         models = load_models(device)
@@ -178,7 +199,7 @@ def generate_notes(audio_path, difficulty="Expert", *, bpm=None, thr=0.85,
 @torch.no_grad()
 def run(audio_path, difficulty="Expert", out_dir="out/generated", *,
         bpm=None, thr=0.85, models=None, device="cpu", write_audio=True,
-        temperature=1.0, seed=None):
+        temperature=DEFAULT_TEMPERATURE, seed=None):
     """Single-difficulty wrapper: generate + pack a playable map. (out_dir, stats)."""
     if models is None:
         models = load_models(device)
@@ -199,14 +220,12 @@ def main():
     ap.add_argument("--out", type=Path, default=Path("out/generated"))
     ap.add_argument("--bpm", type=float, default=None)
     ap.add_argument("--thr", type=float, default=0.85)
-    ap.add_argument("--temperature", type=float, default=1.0,
-                    help="note sampling temperature (0 = greedy argmax)")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
     out_dir, stats = run(args.audio, args.difficulty, args.out,
                          bpm=args.bpm, thr=args.thr, device=args.device,
-                         temperature=args.temperature, seed=args.seed)
+                         seed=args.seed)
     for k, v in stats.items():
         print(f"{k:16s}: {v}")
     print(f"\nmap -> {out_dir}")
