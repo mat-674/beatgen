@@ -141,3 +141,30 @@ def check_hparams(ckpt_hparams: dict | None, current: dict, label: str) -> None:
     if drift:
         pretty = ", ".join(f"{k}: ckpt={a} != current={b}" for k, (a, b) in drift.items())
         print(f"[{label}] WARNING: hparams drift — {pretty}", flush=True)
+
+
+# Backend priority for torch.compile on CUDA:
+#   1. inductor (default) — fastest, needs Triton. Works on Linux+CUDA where
+#      Triton is bundled with the official PyTorch wheels.
+#   2. aot_eager — dynamo graph + eager eval, no Triton. Fallback when the
+#      Triton wheel isn't usable (the Windows case the original code targeted).
+#   3. eager — last resort.
+#
+# `suppress_errors=True` so any later compile failure during graph capture
+# falls back to eager instead of raising. Returns (model, compiled: bool).
+def try_compile(model, device, *, enabled: bool = True, label: str = "compile"):
+    """Best-effort torch.compile with a graceful fallback chain."""
+    if not enabled or device != "cuda":
+        return model, False
+    import torch._dynamo as _d
+    _d.config.suppress_errors = True
+    for backend in ("inductor", "aot_eager"):
+        try:
+            compiled = torch.compile(model, backend=backend)
+            print(f"[{label}] torch.compile backend={backend!r}", flush=True)
+            return compiled, True
+        except Exception as e:
+            print(f"[{label}] backend={backend!r} failed ({e!r}); trying next.",
+                  flush=True)
+    print(f"[{label}] all backends failed; running eager.", flush=True)
+    return model, False

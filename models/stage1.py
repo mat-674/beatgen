@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features.audio import time_to_frame  # noqa: E402
 from features.audio import N_MELS  # noqa: E402
 from models.common import (MelCache, N_DIFF, list_beatmaps, load_canonical,  # noqa: E402
-                          save_with_backup, check_hparams)
+                          save_with_backup, check_hparams, try_compile)
 
 CROP = 1024
 CKPT = Path("models/_ckpt/stage1.pt")
@@ -165,26 +165,11 @@ def main():
     # Safe here — the input shape never varies across the training loop.
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
-    # torch.compile: 2-3× speedup on TCN forward, but on Windows the default
-    # backend (inductor) needs Triton — which often isn't installed/usable in
-    # the local torch build. Use `aot_eager` backend instead: it runs dynamo's
-    # AOT autograd but evaluates the resulting graph in plain eager mode, so
-    # no kernel codegen / no triton dependency. This is a "free correctness"
-    # pass with most of the per-step Python overhead removed.
-    # If even that fails, suppress_errors=True makes any later compile failure
-    # fall back to pure eager (slow but works).
-    import torch._dynamo as _d
-    if (not args.no_compile) and (device == "cuda"):
-        _d.config.suppress_errors = True
-        try:
-            model = torch.compile(model, backend="aot_eager")
-            compiled = True
-        except Exception as e:
-            print(f"[stage1] torch.compile(aot_eager) failed ({e!r}); "
-                  "running eager.", flush=True)
-            compiled = False
-    else:
-        compiled = False
+    # torch.compile: 2-3× speedup on the TCN forward pass. On Linux+CUDA the
+    # default `inductor` backend is available (Triton ships with the wheel);
+    # common.try_compile picks the best backend and falls back gracefully.
+    model, compiled = try_compile(model, device,
+                                  enabled=not args.no_compile, label="stage1")
     if args.resume is not None:
         # weights_only=False: our own checkpoint format ({"model", "mean", "std", "hparams"}),
         # saved with save_with_backup. Trusted local file, not untrusted download.

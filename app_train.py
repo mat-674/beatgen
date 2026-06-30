@@ -114,9 +114,12 @@ class TrainRunner:
             self.status = "running"
         cmd = [sys.executable, "-u", str(ROOT / "models" / f"{stage}.py"), *args]
         # -u so the child flushes stdout line-by-line into our pipe.
+        # encoding="utf-8" + errors="replace" — without this, on a Linux host
+        # with LANG=C the parent crashes with UnicodeDecodeError on the first
+        # non-ASCII log line (the UI strings are bilingual).
         self.proc = subprocess.Popen(
             cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, bufsize=1, encoding="utf-8", errors="replace",
         )
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()
@@ -261,9 +264,10 @@ class BuildRunner:
                *srcs, "--out", out_dir]
         if force:
             cmd.append("--force")
+        # See TrainRunner.start for why encoding="utf-8" + errors="replace".
         self.proc = subprocess.Popen(
             cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, bufsize=1, encoding="utf-8", errors="replace",
         )
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()

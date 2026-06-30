@@ -26,7 +26,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features.audio import N_MELS  # noqa: E402
-from models.common import MelCache, N_DIFF, list_beatmaps  # noqa: E402
+from models.common import MelCache, N_DIFF, list_beatmaps, try_compile  # noqa: E402
 from models.stage1 import CROP, Stage1Net, build_labels, evaluate as eval_stage1_fn  # noqa: E402
 from models.stage2 import (  # noqa: E402
     CTX_RADIUS, Stage2Net, build_sequences, eval_presence as eval_stage2_fn,
@@ -41,18 +41,8 @@ _DEFAULTS = {
 
 
 def _maybe_compile(model, device, enabled: bool):
-    """Same ``aot_eager`` policy as the training scripts: try compile, fall
-    back to eager on any failure (incl. Windows + missing Triton)."""
-    if not enabled or device != "cuda":
-        return model, False
-    import torch._dynamo as _d
-    _d.config.suppress_errors = True
-    try:
-        return torch.compile(model, backend="aot_eager"), True
-    except Exception as e:
-        print(f"[eval] torch.compile(aot_eager) failed ({e!r}); running eager.",
-              flush=True)
-        return model, False
+    """Try compile with the best backend; same fallback chain as training."""
+    return try_compile(model, device, enabled=enabled, label="eval")
 
 
 def _ckpt_hparam(ckpt, key, default):

@@ -23,8 +23,9 @@ import sys
 import time
 from pathlib import Path
 
-# Make this script runnable both as ``python scripts/fetch_community_maps.py``
-# and ``python -m scripts.fetch_community_maps`` from the project root.
+# Make this script runnable as ``python scripts/fetch_community_maps.py``
+# from the project root. (``python -m scripts.fetch_community_maps`` would
+# require `scripts/__init__.py`, which doesn't exist; stick to direct form.)
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "scripts"))
 

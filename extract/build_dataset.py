@@ -81,7 +81,11 @@ def unique_id(base: str, used: set) -> str:
 
 
 def _rss_mb() -> float | None:
-    """Best-effort RSS in MB. None if no source available (e.g. Windows w/o psutil)."""
+    """Best-effort RSS in MB.
+
+    Uses psutil when installed; falls back to ``os.getrusage()`` on Linux/macOS
+    (returns None on Windows, where ``getrusage`` is unavailable).
+    """
     try:
         import psutil
         return psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
@@ -97,6 +101,7 @@ def _rss_mb() -> float | None:
 
 
 # Picklable worker entry — top-level so it survives spawn().
+# Safe under fork too: no import-time threading.Lock / CUDA context / file handles.
 def _process_one(args):
     """Process a single (kind, payload) task inside a worker.
 
@@ -273,7 +278,13 @@ def main():
     import threading
     from multiprocessing.pool import Pool
 
-    ctx = mp.get_context("spawn")                                    # safest on Windows + macOS
+    # fork is fastest on Linux (no per-worker interpreter init), and the worker
+    # is fork-safe (top-level function, no import-time state). macOS and Windows
+    # require `spawn` because fork can't safely re-exec the main module on them.
+    if sys.platform.startswith("linux"):
+        ctx = mp.get_context("fork")
+    else:
+        ctx = mp.get_context("spawn")
     # maxtasksperchild=1: each worker is recycled after every task. This eliminates
     # any chance of silent memory growth inside the worker between tasks AND it
     # makes "is the worker actually doing something?" visible in the log (different

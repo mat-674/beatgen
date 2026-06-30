@@ -24,7 +24,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features.audio import N_MELS, time_to_frame  # noqa: E402
 from models.common import (MelCache, N_DIFF, list_beatmaps, load_canonical,  # noqa: E402
-                          save_with_backup, check_hparams)
+                          save_with_backup, check_hparams, try_compile)
 
 CKPT = Path("models/_ckpt/stage2.pt")
 
@@ -345,23 +345,11 @@ def main():
     model = Stage2Net(hid=args.hid, layers=args.layers, demb=args.demb).to(device)
     # torch.compile gives a clean 2-3× on small GRUs because the kernel-launch
     # overhead is a meaningful fraction of per-step time at bs=16 / L≤2048.
-    # On Windows the default backend (inductor) needs Triton, which is often
-    # missing or unusable in the local torch build. `aot_eager` backend runs
-    # dynamo's AOT autograd but evaluates in plain eager mode — no kernel
-    # codegen, no triton. If even that fails, suppress_errors=True forces
-    # fallback to pure eager.
-    import torch._dynamo as _d
-    if (not args.no_compile) and (device == "cuda"):
-        _d.config.suppress_errors = True
-        try:
-            model = torch.compile(model, backend="aot_eager")
-            compiled = True
-        except Exception as e:
-            print(f"[stage2] torch.compile(aot_eager) failed ({e!r}); "
-                  "running eager.", flush=True)
-            compiled = False
-    else:
-        compiled = False
+    # On Linux+CUDA the default `inductor` backend works (Triton ships with
+    # the wheel); common.try_compile picks the best backend and falls back
+    # gracefully to `aot_eager` and finally eager.
+    model, compiled = try_compile(model, device,
+                                  enabled=not args.no_compile, label="stage2")
     if args.resume is not None:
         # weights_only=False: our own checkpoint format ({"model", "mean", "std", "hparams"}),
         # saved with save_with_backup. Trusted local file, not untrusted download.

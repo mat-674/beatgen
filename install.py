@@ -77,8 +77,10 @@ def main():
 
     rel = py if args.no_venv else venv_python(ROOT / args.venv)
     print("\n✅ Done. Next steps:")
-    print(f"  Build dataset : {rel} extract/build_dataset.py")
-    print(f"  Cache mels    : {rel} features/build_features.py")
+    # Default `SRC` is BeatmapLevelsData/ — the official OST/DLC Unity bundles
+    # the README ships alongside. Pass a different folder (or several) to
+    # point at community maps or a different bundle layout.
+    print(f"  Build dataset : {rel} extract/build_dataset.py BeatmapLevelsData --out dataset")
     print(f"  Train stage 1 : {rel} models/stage1.py --epochs 30")
     print(f"  Train stage 2 : {rel} models/stage2.py --epochs 30")
     print(f"  Launch UI     : {rel} app.py")
