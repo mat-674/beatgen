@@ -149,4 +149,4 @@ def build():
 
 if __name__ == "__main__":
     UI_OUT.mkdir(parents=True, exist_ok=True)
-    build().launch()
+    build().launch(share=True)
