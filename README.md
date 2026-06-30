@@ -252,6 +252,57 @@ The full base game + DLC OST (326 levels) is already wired in. To go beyond it:
 3. For real training, install the CUDA build (`python install.py --runtime cuda`) and train
    with more epochs; the scripts pick up the GPU automatically.
 
+### 7a. Scaled run (RTX-class GPU, 11× data)
+
+When the dataset crosses a few thousand songs (OST + DLC + ranked maps from BeatLeader
+via `scripts/fetch_community_maps.py` landing in `data/community_maps/`), the original
+`hid=256, layers=2, bs=16, steps=80` defaults start to bottleneck capacity. The defaults
+in `app_train.py` already reflect the scaled configuration; you can also invoke the
+scripts directly. The figures below are what the gradio UI sends by default — copy
+them straight into the sliders.
+
+**Stage 1 — TCN onsets**
+
+| | Default | Scaled |
+|---|---|---|
+| Epochs | 50 | 50 |
+| Steps/epoch | 200 | 200 |
+| Batch size | 64 | 64 |
+| Hid (TCN width) | 384 | 384 |
+| LR | 1e-3 | 1e-3 |
+| bf16 autocast | on (CUDA) | on (CUDA) |
+| `torch.compile` | on (CUDA) | on (CUDA) |
+
+**Stage 2 — GRU notes**
+
+| | Default | Scaled |
+|---|---|---|
+| Epochs | 50 | 50 |
+| Packed batch size | 16 | 16 |
+| Hid (GRU width) | 384 | 384 |
+| Layers | 3 | 3 |
+| ctx_radius (frames) | 6 | 6 |
+| LR | 1e-3 | 1e-3 |
+| bf16 autocast | on (CUDA) | on (CUDA) |
+| `torch.compile` | on (CUDA) | on (CUDA) |
+
+The CLI equivalents (for debugging outside the UI):
+
+```bash
+# Stage 1: ~2-3 h on RTX 4090, longer on 3060
+python -u models/stage1.py --epochs 50 --steps 200 --bs 64 --hid 384 \
+    --data dataset
+
+# Stage 2: ~1-2 h on RTX 4090
+python -u models/stage2.py --epochs 50 --hid 384 --layers 3 --bs 16 \
+    --ctx-radius 6 --data dataset
+```
+
+Checkpoints now carry the architecture they were trained with in an `hparams` block
+(`hid`, `layers`, `demb`, `ctx_radius`, `crop`). `generate.py` reads it on load so
+the inference model shape always matches the trained one — no manual sync needed
+when you bump the defaults.
+
 ---
 
 ## 8. Current status & limitations

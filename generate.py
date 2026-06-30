@@ -70,16 +70,31 @@ def models_available() -> bool:
 
 
 def load_models(device: str = "cpu") -> dict:
-    """Load both stage checkpoints once; reuse across many generations."""
+    """Load both stage checkpoints once; reuse across many generations.
+
+    Honours the `hparams` block that the trainer now writes into every checkpoint.
+    Older checkpoints (no `hparams`) fall back to the architecture defaults
+    baked into Stage1Net / Stage2Net, which kept `hid=256` for the 327-song run
+    and `hid=384 / layers=3` from this point on — drifting the training defaults
+    without also bumping inference would silently misshape `load_state_dict`.
+    """
     if not models_available():
         raise FileNotFoundError(
             f"missing checkpoints ({CKPT1.name}/{CKPT2.name}) — train first "
             "(models/stage1.py, models/stage2.py)")
     s1 = torch.load(CKPT1, map_location=device, weights_only=False)
-    m1 = Stage1Net().to(device); m1.load_state_dict(s1["model"]); m1.eval()
+    h1 = s1.get("hparams") or {}
+    m1 = Stage1Net(hid=h1.get("hid", 384),
+                   demb=h1.get("demb", 16)).to(device)
+    m1.load_state_dict(s1["model"]); m1.eval()
     s2 = torch.load(CKPT2, map_location=device, weights_only=False)
-    m2 = Stage2Net().to(device); m2.load_state_dict(s2["model"]); m2.eval()
-    return {"device": device, "m1": m1, "s1": s1, "m2": m2, "s2": s2}
+    h2 = s2.get("hparams") or {}
+    m2 = Stage2Net(hid=h2.get("hid", 384),
+                   layers=h2.get("layers", 3),
+                   demb=h2.get("demb", 16)).to(device)
+    m2.load_state_dict(s2["model"]); m2.eval()
+    return {"device": device, "m1": m1, "s1": s1, "m2": m2, "s2": s2,
+            "ctx_radius": h2.get("ctx_radius", 6)}
 
 
 def analyze(audio_path, bpm=None):
@@ -147,7 +162,9 @@ def generate_notes(audio_path, difficulty="Expert", *, bpm=None, thr=0.85,
     prev = np.zeros(NOTE_VEC, dtype=np.float32)
     last_color = None                                   # for fallback alternation nudge
     for f in frames:
-        ctx = torch.tensor(mel_context(mel2, f)[None, None], device=device)
+        # Use the ctx_radius the model was trained with — falls back to the
+        # module default (CTX_RADIUS=6) when the checkpoint predates hparams.
+        ctx = torch.tensor(mel_context(mel2, f, r=models.get("ctx_radius"))[None, None], device=device)
         out, h = m2(ctx, diff_t, torch.tensor(prev[None, None], device=device), h)
         (rp, rx, ry, rd), (bp, bx, by, bd) = Stage2Net.split(out)
         rp, bp = torch.sigmoid(rp).item(), torch.sigmoid(bp).item()

@@ -188,6 +188,41 @@ def discover_levels(root: Path):
                     yield lvl
 
 
+# ---------------------------------------------------------------- lightweight discovery
+# `discover_levels` above opens each bundle via UnityPy in the calling process — fine for
+# a one-shot script, but it pins ~50 MB of WAV bytes per level into memory simultaneously.
+# When called from a parallel pool with hundreds of OST bundles, that explodes RAM.
+# The two iterators below are cheap: they only walk the filesystem and look at file
+# headers; the heavy UnityPy load happens later, in the worker that owns the level.
+
+def iter_level_tasks(root: Path):
+    """Yield light-weight "level tasks" — each is (kind, payload).
+
+    `kind` is one of:
+      - "bundle":   payload = absolute bundle path (Unity bundle, magic-checked)
+      - "map":      payload = (folder, info_filename)
+
+    UnityPy / librosa are NOT touched here — call `load_bundle_level` /
+    `load_map_folder` on the worker side.
+    """
+    root = Path(root)
+    if root.is_file():
+        if is_unity_bundle(root):
+            yield ("bundle", str(root))
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        d = Path(dirpath)
+        info = _find_info(filenames)
+        if info:
+            yield ("map", (str(d), info))
+            continue                      # map folders don't host bundles
+        for fn in filenames:
+            p = d / fn
+            if is_unity_bundle(p):
+                yield ("bundle", str(p))
+
+
 def normalize_difficulties(level: dict) -> dict[str, dict]:
     """Convert each native beatmap to the canonical schema using the level BPM."""
     bpm = level["bpm"]

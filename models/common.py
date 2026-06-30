@@ -93,7 +93,14 @@ def save_with_backup(state: dict, out_dir: Path, name: str) -> Path:
     """Write <name>.latest.pt (overwrite) and <name>.bak-<UTC ts>.pt (unique copy).
 
     The caller passes the same dict shape used elsewhere in the project:
-        {"model": state_dict, "mean": float|ndarray, "std": float|ndarray}
+        {"model": state_dict, "mean": float|ndarray, "std": float|ndarray,
+         "hparams": {"hid": ..., "layers": ..., ...}}    # optional, recommended
+
+    `hparams` records the architecture/training choices that produced this
+    checkpoint so inference (or a future resume) can rebuild the model with
+    matching shape — the previous format silently assumed fixed hid=256 etc.
+    Missing keys are tolerated: older checkpoints without `hparams` still load.
+
     Returns the path to the latest file. Used by both training stages so the UI can
     see a fresh checkpoint after every eval and also keep a timestamped history.
 
@@ -112,3 +119,25 @@ def save_with_backup(state: dict, out_dir: Path, name: str) -> Path:
     except OSError:
         shutil.copy2(latest, bak)
     return latest
+
+
+def check_hparams(ckpt_hparams: dict | None, current: dict, label: str) -> None:
+    """Warn (not fail) if a resumed checkpoint's hparams drift from current CLI args.
+
+    Called by both stage1/stage2 right after `model.load_state_dict(ckpt["model"])`.
+    A drift means we're loading weights trained with a different shape: many keys
+    will still load via `strict=False`-style silent partial loads, but anything
+    that *did* load will produce garbage at shapes that don't match the running
+    model's expectations. Loud warning + flushed stdout keeps this visible in
+    the UI log so the user can decide whether to `--resume` with matching args.
+
+    Only logs differences; never raises.
+    """
+    if not ckpt_hparams:
+        return
+    drift = {k: (ckpt_hparams.get(k), current.get(k))
+             for k in current
+             if ckpt_hparams.get(k) != current.get(k)}
+    if drift:
+        pretty = ", ".join(f"{k}: ckpt={a} != current={b}" for k, (a, b) in drift.items())
+        print(f"[{label}] WARNING: hparams drift — {pretty}", flush=True)

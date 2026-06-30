@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features.audio import time_to_frame  # noqa: E402
 from features.audio import N_MELS  # noqa: E402
 from models.common import (MelCache, N_DIFF, list_beatmaps, load_canonical,  # noqa: E402
-                          save_with_backup)
+                          save_with_backup, check_hparams)
 
 CROP = 1024
 CKPT = Path("models/_ckpt/stage1.pt")
@@ -45,7 +45,7 @@ class ResBlock(nn.Module):
 class Stage1Net(nn.Module):
     """TCN: per-frame onset logits from mel + difficulty embedding."""
 
-    def __init__(self, n_mels=N_MELS, n_diff=N_DIFF, demb=16, hid=256,
+    def __init__(self, n_mels=N_MELS, n_diff=N_DIFF, demb=16, hid=384,
                  dilations=(1, 2, 4, 8, 16, 32, 64)):
         super().__init__()
         self.diff_emb = nn.Embedding(n_diff, demb)
@@ -115,10 +115,17 @@ def evaluate(model, beatmaps, labels, cache, device, thr=0.5):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--epochs", type=int, default=60)
-    ap.add_argument("--steps", type=int, default=80)
-    ap.add_argument("--bs", type=int, default=16)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--steps", type=int, default=200)
+    ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--hid", type=int, default=384,
+                    help="TCN hidden width (was 256 in the original 327-song run; "
+                         "bumped to 384 for the 11× dataset — still <1GB VRAM).")
+    ap.add_argument("--demb", type=int, default=16,
+                    help="difficulty embedding width (rarely worth changing).")
+    ap.add_argument("--no-compile", action="store_true",
+                    help="skip torch.compile (useful for debugging or older torch).")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--data", type=Path, default=Path("dataset"))
     ap.add_argument("--resume", type=Path, default=None,
@@ -153,12 +160,41 @@ def main():
     print(f"[stage1] beatmaps: {len(train)} train / {len(val)} val | "
           f"pos_rate={(pos/tot if tot else 0):.4f} pos_weight={pos_w:.1f}", flush=True)
 
-    model = Stage1Net().to(device)
+    model = Stage1Net(hid=args.hid, demb=args.demb).to(device)
+    # cudnn.benchmark=True picks the fastest Conv1d algo for the fixed CROP=1024 shape.
+    # Safe here — the input shape never varies across the training loop.
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+    # torch.compile: 2-3× speedup on TCN forward, but on Windows the default
+    # backend (inductor) needs Triton — which often isn't installed/usable in
+    # the local torch build. Use `aot_eager` backend instead: it runs dynamo's
+    # AOT autograd but evaluates the resulting graph in plain eager mode, so
+    # no kernel codegen / no triton dependency. This is a "free correctness"
+    # pass with most of the per-step Python overhead removed.
+    # If even that fails, suppress_errors=True makes any later compile failure
+    # fall back to pure eager (slow but works).
+    import torch._dynamo as _d
+    if (not args.no_compile) and (device == "cuda"):
+        _d.config.suppress_errors = True
+        try:
+            model = torch.compile(model, backend="aot_eager")
+            compiled = True
+        except Exception as e:
+            print(f"[stage1] torch.compile(aot_eager) failed ({e!r}); "
+                  "running eager.", flush=True)
+            compiled = False
+    else:
+        compiled = False
     if args.resume is not None:
-        # weights_only=False: our own checkpoint format ({"model", "mean", "std"}),
+        # weights_only=False: our own checkpoint format ({"model", "mean", "std", "hparams"}),
         # saved with save_with_backup. Trusted local file, not untrusted download.
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        # When the model is compiled, state_dict lives behind `model._orig_mod`.
+        target = model._orig_mod if compiled and hasattr(model, "_orig_mod") else model
+        target.load_state_dict(ckpt["model"])
+        check_hparams(ckpt.get("hparams"),
+                      {"hid": args.hid, "demb": args.demb, "crop": CROP},
+                      label="stage1")
         # keep the resumed mel-std in sync with the cache so the loss is comparable
         old_mean = float(ckpt.get("mean", cache.mean))
         old_std = float(ckpt.get("std", cache.std))
@@ -171,7 +207,12 @@ def main():
         cache.std = old_std
         print(f"[stage1] resumed from {args.resume}", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # pos_weight stays fp32 and the loss itself is kept OUTSIDE autocast: BCE
+    # reduction in bf16 is fine on RTX 30/40 but mixing pos_weight dtype with the
+    # autocast logits can flip underflow patterns. Standard pattern is autocast
+    # around the forward only, fp32 loss outside.
     lossf = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_w, device=device))
+    use_amp = (device == "cuda")
 
     # Track the best F1 we have seen so we can save a stable `stage1.best.pt`
     # (the .latest.pt checkpoint always reflects the last epoch, which may have
@@ -191,19 +232,29 @@ def main():
         for _ in range(args.steps):
             mel, diff, lab = sample_batch(train, labels, cache, args.bs, device, rng)
             opt.zero_grad()
-            loss = lossf(model(mel, diff), lab)
+            if use_amp:
+                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = model(mel, diff)
+                loss = lossf(logits, lab)
+            else:
+                loss = lossf(model(mel, diff), lab)
             loss.backward(); opt.step()
             tot_loss += loss.item()
         if ep % 5 == 0 or ep == args.epochs:
             p, r, f1 = evaluate(model, val, labels, cache, device)
             # best.pt: only overwrite on strict improvement so it never regresses.
+            # When the model is compiled, state_dict() walks through `_orig_mod`.
+            state = model.state_dict() if not (compiled and hasattr(model, "_orig_mod")) \
+                else model._orig_mod.state_dict()
             if f1 > best_f1:
                 best_f1 = f1
                 no_improve = 0
                 best_path = args.out_dir / "stage1.best.pt"
                 tmp = best_path.with_suffix(".tmp.pt")
-                torch.save({"model": model.state_dict(),
-                            "mean": cache.mean, "std": cache.std}, tmp)
+                torch.save({"model": state,
+                            "mean": cache.mean, "std": cache.std,
+                            "hparams": {"hid": args.hid, "demb": args.demb, "crop": CROP}},
+                           tmp)
                 os.replace(tmp, best_path)
                 best_tag = f" best F1 {f1:.3f} -> {best_path}"
                 # Mirror best -> legacy stage1.pt so callers that hardcode that
@@ -223,7 +274,8 @@ def main():
             print(f"[stage1] ep {ep:3d} loss {tot_loss/args.steps:.4f} | "
                   f"val P {p:.3f} R {r:.3f} F1 {f1:.3f}{best_tag}", flush=True)
             latest = save_with_backup(
-                {"model": model.state_dict(), "mean": cache.mean, "std": cache.std},
+                {"model": state, "mean": cache.mean, "std": cache.std,
+                 "hparams": {"hid": args.hid, "demb": args.demb, "crop": CROP}},
                 args.out_dir, "stage1",
             )
             print(f"[stage1] saved -> {latest}", flush=True)

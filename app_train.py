@@ -412,7 +412,8 @@ class PipelineRunner:
                 self.step = "stage1"; self.step_idx = 1
             args1 = ["--epochs", str(int(epochs1)), "--data", out_dir,
                      "--device", device, "--lr", str(float(lr1)),
-                     "--steps", str(int(steps1)), "--bs", str(int(bs1))]
+                     "--steps", str(int(steps1)), "--bs", str(int(bs1)),
+                     "--hid", "384", "--demb", "16"]
             with self._lock:
                 _push_log(self.log, f"[pipeline] step 2/3 — stage1: python -u models/stage1.py {' '.join(args1)}")
             RUNNER.start("stage1", args1)
@@ -427,7 +428,9 @@ class PipelineRunner:
             with self._lock:
                 self.step = "stage2"; self.step_idx = 2
             args2 = ["--epochs", str(int(epochs2)), "--data", out_dir,
-                     "--device", device, "--lr", str(float(lr2))]
+                     "--device", device, "--lr", str(float(lr2)),
+                     "--hid", "384", "--layers", "3", "--bs", "16",
+                     "--ctx-radius", "6", "--demb", "16"]
             if ckpt1:
                 args2 += ["--resume", str(Path(ckpt1))]
                 with self._lock:
@@ -653,7 +656,11 @@ def start_click(mode: str, stage: str, data_dir: str, epochs: int,
     args = ["--epochs", str(int(epochs)), "--data", str(p),
             "--device", device, "--lr", str(float(lr))]
     if stage == "stage1":
-        args += ["--steps", str(int(steps)), "--bs", str(int(bs))]
+        args += ["--steps", str(int(steps)), "--bs", str(int(bs)),
+                 "--hid", "384", "--demb", "16"]
+    else:  # stage2 — packed-sequence mode with the scaled architecture defaults
+        args += ["--hid", "384", "--layers", "3", "--bs", "16",
+                 "--ctx-radius", "6", "--demb", "16"]
     if mode == "Fine-tune":
         if not resume or not Path(resume).is_file():
             return (*_err("Fine-tune needs a valid `--resume` path to a .pt"), "",
@@ -814,8 +821,8 @@ def build_train_tab() -> dict:
                     p_force = gr.Checkbox(value=False,
                                           label="Force rebuild (recompute mel.npy)")
                     with gr.Row():
-                        p_epochs1 = gr.Slider(1, 200, value=40, step=1, label="Stage1 epochs")
-                        p_epochs2 = gr.Slider(1, 200, value=30, step=1, label="Stage2 epochs")
+                        p_epochs1 = gr.Slider(1, 200, value=50, step=1, label="Stage1 epochs")
+                        p_epochs2 = gr.Slider(1, 200, value=50, step=1, label="Stage2 epochs")
                     with gr.Row():
                         p_lr1 = gr.Number(value=1e-3, label="LR stage1", precision=4)
                         p_lr2 = gr.Number(value=1e-3, label="LR stage2", precision=4)
@@ -826,10 +833,10 @@ def build_train_tab() -> dict:
                         placeholder="dataset   |   C:/data/my_dataset",
                         value="dataset")
                     stage = gr.Radio(["stage1", "stage2"], value="stage1", label="Stage")
-                    epochs = gr.Slider(1, 200, value=40, step=1, label="Epochs")
+                    epochs = gr.Slider(1, 200, value=50, step=1, label="Epochs")
                     with gr.Row():
-                        steps = gr.Slider(4, 400, value=80, step=4, label="Steps/epoch (stage1)")
-                        bs = gr.Slider(2, 64, value=16, step=2, label="Batch size (stage1)")
+                        steps = gr.Slider(4, 400, value=200, step=4, label="Steps/epoch (stage1)")
+                        bs = gr.Slider(2, 128, value=64, step=2, label="Batch size (stage1)")
                     lr = gr.Number(value=1e-3, label="Learning rate", precision=4)
                     resume = gr.Textbox(label="Resume .pt path (Fine-tune only)",
                                         placeholder="models/_ckpt/stage1.latest.pt")

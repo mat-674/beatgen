@@ -24,7 +24,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features.audio import N_MELS, time_to_frame  # noqa: E402
 from models.common import (MelCache, N_DIFF, list_beatmaps, load_canonical,  # noqa: E402
-                          save_with_backup)
+                          save_with_backup, check_hparams)
 
 CKPT = Path("models/_ckpt/stage2.pt")
 
@@ -33,7 +33,7 @@ N_X, N_Y, N_D, N_PRESENT = 4, 3, 9, 1
 PER_NOTE_VEC = N_PRESENT + N_X + N_Y + N_D      # 17
 RED_OFFSET, BLUE_OFFSET = 0, PER_NOTE_VEC       # 0, 17
 NOTE_VEC = 2 * PER_NOTE_VEC                     # 34 (encoder width)
-CTX_RADIUS = 4                                  # mel_context window half-width (frames, ~210 ms)
+CTX_RADIUS = 6                                  # mel_context window half-width (frames, ~315 ms at HOP=512/44100)
 CTX_DIM = 2 * N_MELS                            # mel_context = concat(mean, max) over the window
 
 # Slice offsets inside one hand's PER_NOTE_VEC block, for readability at call sites.
@@ -71,13 +71,19 @@ def actions_from_beatmap(notes):
     return acts
 
 
-def mel_context(mel: np.ndarray, frame: int, r: int = CTX_RADIUS) -> np.ndarray:
+def mel_context(mel: np.ndarray, frame: int, r: int | None = None) -> np.ndarray:
     """Local audio summary around an action: concat(mean, max) over a +/-r window.
 
     A plain mean over +/-1 frame gave the GRU almost no music to ground colour/position
     on, so it leaned on the previous-note teacher forcing and collapsed (all one colour
     / one column). A wider window plus a max channel restores real audio discrimination.
+
+    `r=None` falls back to the module-level `CTX_RADIUS` (current default 6 — was 4
+    in the 327-song run; bumped because ranked maps have more chromatic detail that
+    benefits from a slightly larger audio window).
     """
+    if r is None:
+        r = CTX_RADIUS
     T = mel.shape[0]
     if T == 0:
         return np.zeros(2 * mel.shape[1], dtype=np.float32)
@@ -88,7 +94,7 @@ def mel_context(mel: np.ndarray, frame: int, r: int = CTX_RADIUS) -> np.ndarray:
 
 
 class Stage2Net(nn.Module):
-    def __init__(self, n_diff=N_DIFF, demb=16, hid=256, layers=2, ctx_dim=CTX_DIM):
+    def __init__(self, n_diff=N_DIFF, demb=16, hid=384, layers=3, ctx_dim=CTX_DIM):
         super().__init__()
         self.diff_emb = nn.Embedding(n_diff, demb)
         self.ctx_proj = nn.Linear(ctx_dim, 128)
@@ -135,47 +141,133 @@ def build_sequences(beatmaps, cache):
     return seqs
 
 
-def seq_loss(out, tgt, device, pos_weight=None):
-    (rp, rx, ry, rd), (bp, bx, by, bd) = Stage2Net.split(out)
-    t = torch.tensor(tgt, device=device)
-    rw, bw = (pos_weight if pos_weight is not None else (None, None))
-    loss = F.binary_cross_entropy_with_logits(rp, t[:, :, 0].float(), pos_weight=rw)
-    loss = loss + F.binary_cross_entropy_with_logits(bp, t[:, :, 4].float(), pos_weight=bw)
+def seq_loss(out, tgt, device, pos_weight=None, lengths=None):
+    """Per-sequence loss. `tgt` is a numpy array of shape (B, L, 8) for the *unpadded*
+    longest sequence in the batch; `lengths` (1-D tensor/array of ints, length B)
+    tells which prefix of each row is real (the rest is padding from pad_sequence).
 
-    def ce(logits, ti, present):
-        m = present.bool()
+    When `lengths is None` we treat the whole batch as one real sequence (bs=1
+    legacy path) — keeps the original single-sequence training mode working.
+    """
+    (rp, rx, ry, rd), (bp, bx, by, bd) = Stage2Net.split(out)
+    t = torch.as_tensor(tgt, device=device)
+    if lengths is None:
+        # Legacy single-sequence mode: every position is valid, keep old math.
+        rw, bw = (pos_weight if pos_weight is not None else (None, None))
+        loss = F.binary_cross_entropy_with_logits(rp, t[:, :, 0].float(), pos_weight=rw)
+        loss = loss + F.binary_cross_entropy_with_logits(bp, t[:, :, 4].float(), pos_weight=bw)
+
+        def ce(logits, ti, present):
+            m = present.bool()
+            if m.any():
+                return F.cross_entropy(logits[m], t[:, :, ti][m])
+            return torch.zeros((), device=device)
+        pr, pb = t[:, :, 0], t[:, :, 4]
+        loss = loss + ce(rx, 1, pr) + ce(ry, 2, pr) + ce(rd, 3, pr)
+        loss = loss + ce(bx, 5, pb) + ce(by, 6, pb) + ce(bd, 7, pb)
+        return loss
+
+    # ---- Packed mode: mask the padding before reducing ----
+    B, L = rp.shape
+    lens = torch.as_tensor(lengths, device=device).clamp(min=1, max=L)
+    # mask[i, j] = 1 for j < lens[i], 0 otherwise. (B, L) float.
+    mask = (torch.arange(L, device=device)[None, :] < lens[:, None]).float()
+    rw, bw = (pos_weight if pos_weight is not None else
+              (torch.tensor(1.0, device=device), torch.tensor(1.0, device=device)))
+    # Mean over valid positions only — divide by mask.sum(), not B*L.
+    def bce_masked(logits, target, w):
+        # bf16-safe: compute in fp32 by casting logits/target inside the reduction.
+        per = F.binary_cross_entropy_with_logits(
+            logits.float(), target.float(), pos_weight=w, reduction="none"
+        )  # (B, L)
+        return (per * mask).sum() / mask.sum().clamp(min=1.0)
+    loss = bce_masked(rp, t[:, :, 0], rw) + bce_masked(bp, t[:, :, 4], bw)
+
+    def ce_masked(logits, ti, present):
+        m = present.bool() & mask.bool()      # valid AND hand is present
         if m.any():
-            return F.cross_entropy(logits[m], t[:, :, ti][m])
+            return F.cross_entropy(logits[m].float(), t[:, :, ti][m])
         return torch.zeros((), device=device)
     pr, pb = t[:, :, 0], t[:, :, 4]
-    loss = loss + ce(rx, 1, pr) + ce(ry, 2, pr) + ce(rd, 3, pr)
-    loss = loss + ce(bx, 5, pb) + ce(by, 6, pb) + ce(bd, 7, pb)
+    loss = loss + ce_masked(rx, 1, pr) + ce_masked(ry, 2, pr) + ce_masked(rd, 3, pr)
+    loss = loss + ce_masked(bx, 5, pb) + ce_masked(by, 6, pb) + ce_masked(bd, 7, pb)
     return loss
 
 
+def pack_batch(seqs, device):
+    """Pad a list of dicts {diff, ctx, prev, tgt} (already sorted by caller) into a
+    padded batch tensor. Returns:
+        ctx:  (B, L_max, 2*N_MELS)  fp32
+        prev: (B, L_max, NOTE_VEC)  fp32
+        tgt:  (B, L_max, 8)         int64   (rows padded with 0)
+        diff: (B,)                  int64
+        lens: (B,)                  int64   (real length of each row)
+    """
+    import torch.nn.utils.rnn as rnn
+    ctx = rnn.pad_sequence([torch.as_tensor(s["ctx"]) for s in seqs],
+                           batch_first=True).to(device)
+    prev = rnn.pad_sequence([torch.as_tensor(s["prev"]) for s in seqs],
+                            batch_first=True).to(device)
+    tgt = rnn.pad_sequence([torch.as_tensor(s["tgt"]) for s in seqs],
+                           batch_first=True).to(device)
+    lens = torch.tensor([len(s["tgt"]) for s in seqs], dtype=torch.long, device=device)
+    diff = torch.tensor([s["diff"] for s in seqs], dtype=torch.long, device=device)
+    return ctx, prev, tgt, diff, lens
+
+
 @torch.no_grad()
-def eval_presence(model, seqs, device):
+def eval_presence(model, seqs, device, bs: int = 1):
     """Balanced accuracy over per-step present/absent predictions.
 
     Returns a dict with `note_acc` (accuracy on present steps — the legacy metric)
     and `bal_acc` (mean of present + absent accuracy — robust to class imbalance).
     The `note_acc` field is kept for backward compatibility with the UI plot.
+
+    bs=1 is the legacy per-sequence path; bs>1 sorts val by length, packs in
+    buckets, and skips padded positions via the `lens` from pack_batch (a
+    padded row's `tgt[:, 0]` and `tgt[:, 4]` are both 0, but we never look at
+    them because we iterate `for k, ln in enumerate(lens.cpu().numpy().tolist())`
+    and slice `[:, :ln]`).
     """
     model.eval()
     correct_p = total_p = correct_a = total_a = 0
-    for s in seqs:
-        ctx = torch.tensor(s["ctx"][None], device=device)
-        prev = torch.tensor(s["prev"][None], device=device)
-        diff = torch.tensor([s["diff"]], device=device)
-        out, _ = model(ctx, diff, prev)
-        (rp, _, _, _), (bp, _, _, _) = Stage2Net.split(out)
-        for logits, pres in ((rp, s["tgt"][:, 0]), (bp, s["tgt"][:, 4])):
-            pred = (torch.sigmoid(logits[0]) > 0.5).cpu().numpy()
-            truth = pres.astype(bool)
-            correct_p += int((pred & truth).sum())
-            total_p   += int(truth.sum())
-            correct_a += int((~pred & ~truth).sum())
-            total_a   += int((~truth).sum())
+    if bs <= 1:
+        for s in seqs:
+            ctx = torch.tensor(s["ctx"][None], device=device)
+            prev = torch.tensor(s["prev"][None], device=device)
+            diff = torch.tensor([s["diff"]], device=device)
+            out, _ = model(ctx, diff, prev)
+            (rp, _, _, _), (bp, _, _, _) = Stage2Net.split(out)
+            for logits, pres in ((rp, s["tgt"][:, 0]), (bp, s["tgt"][:, 4])):
+                pred = (torch.sigmoid(logits[0]) > 0.5).cpu().numpy()
+                truth = pres.astype(bool)
+                correct_p += int((pred & truth).sum())
+                total_p   += int(truth.sum())
+                correct_a += int((~pred & ~truth).sum())
+                total_a   += int((~truth).sum())
+    else:
+        # Sort by length so each bucket has low padding overhead.
+        order = sorted(range(len(seqs)), key=lambda i: len(seqs[i]["tgt"]))
+        i = 0
+        while i < len(seqs):
+            j = min(i + bs, len(seqs))
+            batch = [seqs[k] for k in order[i:j]]
+            ctx, prev, tgt, diff, lens = pack_batch(batch, device)
+            out, _ = model(ctx, diff, prev)
+            (rp, _, _, _), (bp, _, _, _) = Stage2Net.split(out)
+            rp_b = (torch.sigmoid(rp) > 0.5).cpu().numpy()
+            bp_b = (torch.sigmoid(bp) > 0.5).cpu().numpy()
+            t_b = tgt.cpu().numpy()
+            for k, ln in enumerate(lens.cpu().numpy().tolist()):
+                for logits_row, truth in (
+                    (rp_b[k, :ln], t_b[k, :ln, 0].astype(bool)),
+                    (bp_b[k, :ln], t_b[k, :ln, 4].astype(bool)),
+                ):
+                    correct_p += int((logits_row & truth).sum())
+                    total_p   += int(truth.sum())
+                    correct_a += int((~logits_row & ~truth).sum())
+                    total_a   += int((~truth).sum())
+            i = j
     note_acc = correct_p / max(1, total_p)
     bal_acc  = (correct_p / max(1, total_p) + correct_a / max(1, total_a)) / 2
     return {"note_acc": note_acc, "bal_acc": bal_acc}
@@ -183,8 +275,23 @@ def eval_presence(model, seqs, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--epochs", type=int, default=60)
+    ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--hid", type=int, default=384,
+                    help="GRU hidden width (was 256 in the 327-song run; "
+                         "bumped to 384 for the 11× dataset).")
+    ap.add_argument("--layers", type=int, default=3,
+                    help="GRU layers (was 2; bumped to 3 for deeper note-pattern modelling).")
+    ap.add_argument("--demb", type=int, default=16,
+                    help="difficulty embedding width (rarely worth changing).")
+    ap.add_argument("--bs", type=int, default=16,
+                    help="packed-sequence batch size (was 1 — one sequence per step; "
+                         "with 11× more data the GPU was idle).")
+    ap.add_argument("--ctx-radius", type=int, default=CTX_RADIUS,
+                    help=f"mel_context window half-width in frames "
+                         f"(default {CTX_RADIUS} ≈ 315 ms; was 4 in the 327-song run).")
+    ap.add_argument("--no-compile", action="store_true",
+                    help="skip torch.compile.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--data", type=Path, default=Path("dataset"))
     ap.add_argument("--resume", type=Path, default=None,
@@ -235,12 +342,36 @@ def main():
     print(f"[stage2] x-hist red {dict(sorted(xr.items()))} | blue {dict(sorted(xb.items()))}",
           flush=True)
 
-    model = Stage2Net().to(device)
+    model = Stage2Net(hid=args.hid, layers=args.layers, demb=args.demb).to(device)
+    # torch.compile gives a clean 2-3× on small GRUs because the kernel-launch
+    # overhead is a meaningful fraction of per-step time at bs=16 / L≤2048.
+    # On Windows the default backend (inductor) needs Triton, which is often
+    # missing or unusable in the local torch build. `aot_eager` backend runs
+    # dynamo's AOT autograd but evaluates in plain eager mode — no kernel
+    # codegen, no triton. If even that fails, suppress_errors=True forces
+    # fallback to pure eager.
+    import torch._dynamo as _d
+    if (not args.no_compile) and (device == "cuda"):
+        _d.config.suppress_errors = True
+        try:
+            model = torch.compile(model, backend="aot_eager")
+            compiled = True
+        except Exception as e:
+            print(f"[stage2] torch.compile(aot_eager) failed ({e!r}); "
+                  "running eager.", flush=True)
+            compiled = False
+    else:
+        compiled = False
     if args.resume is not None:
-        # weights_only=False: our own checkpoint format ({"model", "mean", "std"}),
+        # weights_only=False: our own checkpoint format ({"model", "mean", "std", "hparams"}),
         # saved with save_with_backup. Trusted local file, not untrusted download.
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        target = model._orig_mod if compiled and hasattr(model, "_orig_mod") else model
+        target.load_state_dict(ckpt["model"])
+        check_hparams(ckpt.get("hparams"),
+                      {"hid": args.hid, "layers": args.layers, "demb": args.demb,
+                       "ctx_radius": args.ctx_radius},
+                      label="stage2")
         old_mean = float(ckpt.get("mean", cache.mean))
         old_std = float(ckpt.get("std", cache.std))
         if (cache.mean and abs(old_mean - cache.mean) > 0.05 * abs(cache.mean)
@@ -252,6 +383,7 @@ def main():
         cache.std = old_std
         print(f"[stage2] resumed from {args.resume}", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    use_amp = (device == "cuda")
 
     # Track the best balanced-accuracy checkpoint and stop early when it stops
     # improving — see stage1.py for the rationale.
@@ -260,25 +392,44 @@ def main():
     no_improve = 0
 
     for ep in range(1, args.epochs + 1):
-        model.train(); order = rng.permutation(len(tr_seq)); tot = 0.0
-        for i in order:
-            s = tr_seq[i]
-            ctx = torch.tensor(s["ctx"][None], device=device)
-            prev = torch.tensor(s["prev"][None], device=device)
-            diff = torch.tensor([s["diff"]], device=device)
-            out, _ = model(ctx, diff, prev)
-            loss = seq_loss(out, s["tgt"][None], device, pos_weight)
-            opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item()
+        model.train()
+        # Sort by length each epoch so each packed bucket has low padding waste.
+        order = sorted(range(len(tr_seq)), key=lambda i: len(tr_seq[i]["tgt"]))
+        tot = 0.0
+        n_loss = 0
+        i = 0
+        while i < len(order):
+            batch = [tr_seq[k] for k in order[i:i + args.bs]]
+            i += args.bs
+            ctx, prev, tgt, diff, lens = pack_batch(batch, device)
+            opt.zero_grad()
+            if use_amp:
+                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    out, _ = model(ctx, diff, prev)
+                # Loss stays fp32 — seq_loss already casts logits/target inside.
+                loss = seq_loss(out, tgt, device, pos_weight, lengths=lens)
+            else:
+                out, _ = model(ctx, diff, prev)
+                loss = seq_loss(out, tgt, device, pos_weight, lengths=lens)
+            loss.backward(); opt.step()
+            tot += loss.item(); n_loss += 1
         if ep % 5 == 0 or ep == args.epochs:
-            acc = eval_presence(model, va_seq, device)
+            acc = eval_presence(model, va_seq, device, bs=max(args.bs, 1))
             bal = acc["bal_acc"]
+            # When compiled, the canonical state_dict lives behind `_orig_mod`.
+            state = (model._orig_mod.state_dict()
+                     if (compiled and hasattr(model, "_orig_mod"))
+                     else model.state_dict())
             if bal > best_bal:
                 best_bal = bal
                 no_improve = 0
                 best_path = args.out_dir / "stage2.best.pt"
                 tmp = best_path.with_suffix(".tmp.pt")
-                torch.save({"model": model.state_dict(),
-                            "mean": cache.mean, "std": cache.std}, tmp)
+                torch.save({"model": state,
+                            "mean": cache.mean, "std": cache.std,
+                            "hparams": {"hid": args.hid, "layers": args.layers,
+                                        "demb": args.demb, "ctx_radius": args.ctx_radius}},
+                           tmp)
                 os.replace(tmp, best_path)
                 best_tag = f" best bal-acc {bal:.3f} -> {best_path}"
                 # Mirror best -> legacy stage2.pt so hardcoded-path callers
@@ -289,17 +440,19 @@ def main():
                 no_improve += 1
                 best_tag = f" (best bal-acc {best_bal:.3f}, no improve {no_improve}/{EARLY_STOP_PATIENCE_EVALS})"
                 if no_improve >= EARLY_STOP_PATIENCE_EVALS:
-                    print(f"[stage2] ep {ep:3d} loss {tot/len(tr_seq):.4f} | "
+                    print(f"[stage2] ep {ep:3d} loss {tot/max(1,n_loss):.4f} | "
                           f"val note-acc {acc['note_acc']:.3f} bal-acc {bal:.3f}{best_tag}",
                           flush=True)
                     print(f"[stage2] early stop: no bal-acc improvement for "
                           f"{EARLY_STOP_PATIENCE_EVALS * 5} epochs", flush=True)
                     break
-            print(f"[stage2] ep {ep:3d} loss {tot/len(tr_seq):.4f} | "
+            print(f"[stage2] ep {ep:3d} loss {tot/max(1,n_loss):.4f} | "
                   f"val note-acc {acc['note_acc']:.3f} bal-acc {bal:.3f}{best_tag}",
                   flush=True)
             latest = save_with_backup(
-                {"model": model.state_dict(), "mean": cache.mean, "std": cache.std},
+                {"model": state, "mean": cache.mean, "std": cache.std,
+                 "hparams": {"hid": args.hid, "layers": args.layers,
+                             "demb": args.demb, "ctx_radius": args.ctx_radius}},
                 args.out_dir, "stage2",
             )
             print(f"[stage2] saved -> {latest}", flush=True)
