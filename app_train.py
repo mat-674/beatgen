@@ -70,6 +70,22 @@ RE_BUILD_FAIL = re.compile(r"^\[(FAIL|empty)\]\s+(\S+)")
 # came in but the build crashed before that, per-line counters will undercount.
 RE_BUILD_DONE = re.compile(r"^done:\s+(\d+)\s+ok,\s+(\d+)\s+failed")
 
+# fetch_community_maps.py uses `logging.basicConfig` (default: stderr), but our
+# Popen has `stderr=subprocess.STDOUT` so every `log.info/log.error` line is
+# merged into the same pipe the parent reads. Each line lands in the parent's
+# pipe as e.g. ``INFO:fetch_community_maps:[ok    1/500] Song — Diff (...)`` —
+# the LEVEL:logger: prefix is harmless because all our regexes match on
+# substrings.
+RE_FETCH_OK  = re.compile(r"\[ok\s+(\d+)\s*/\s*(\d+)\]")
+RE_FETCH_FAIL = re.compile(r"\[fail\]")
+# Authoritative end-of-run summary (mirrors RE_BUILD_DONE's role).
+RE_FETCH_DONE = re.compile(r"done:\s+(\d+)\s+ok,\s+(\d+)\s+failed")
+# Multi-line `done:` block also carries the manifest path; DOTALL so the
+# regex can span the embedded newlines and arrow character.
+RE_FETCH_MANIFEST = re.compile(r"done:.*→\s*(\S+)\s+\(took", re.S)
+# First line of a run; surfaces the target in the status badge.
+RE_FETCH_SEED = re.compile(r"seed:\s+types=(\S+).*maxSongs=(\d+)")
+
 MODES = ["Cold start", "Fine-tune", "Pipeline"]
 
 
@@ -333,6 +349,142 @@ class BuildRunner:
 BUILDER = BuildRunner()
 
 
+# --- BeatLeader fetcher runner ----------------------------------------------
+# Same shape as BuildRunner, but driving ``scripts/fetch_community_maps.py``
+# (which uses ``logging.basicConfig`` → stderr; the Popen ``stderr=STDOUT``
+# merge below ensures every line lands in the same pipe the parent parses).
+
+@dataclass
+class FetchRunner:
+    """Holds the child process and live state for a single community-maps fetch."""
+
+    proc: subprocess.Popen | None = None
+    started_at: float = 0.0
+    log: list[str] = field(default_factory=list)
+    ok: int = 0
+    fail: int = 0
+    manifest: str = ""        # path to the on-disk _index.sqlite, parsed from the final summary
+    max_songs: int = 0        # surfaced in the running-status badge
+    status: str = "idle"      # idle | running | done | failed | stopped
+    was_stopped: bool = False
+    _reader: threading.Thread | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def is_running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, out_dir: str, max_songs: int, types: str,
+              min_stars: float, min_notes: int, resume: bool):
+        if self.is_running():
+            raise RuntimeError("Fetch is already running. Stop it first.")
+        with self._lock:
+            self.started_at = time.time()
+            self.was_stopped = False
+            cmd_tail = (f"--out {out_dir} --max-songs {int(max_songs)} "
+                        f"--types {types} --min-stars {float(min_stars)} "
+                        f"--min-notes {int(min_notes)} "
+                        f"{'--resume' if resume else '--no-resume'}")
+            self.log = [f"[ui] launching: python -u scripts/fetch_community_maps.py {cmd_tail}"]
+            self.ok = 0
+            self.fail = 0
+            self.manifest = ""
+            self.max_songs = int(max_songs)
+            self.status = "running"
+        cmd = [sys.executable, "-u",
+               str(ROOT / "scripts" / "fetch_community_maps.py"),
+               "--out", out_dir,
+               "--max-songs", str(int(max_songs)),
+               "--types", types,
+               "--min-stars", str(float(min_stars)),
+               "--min-notes", str(int(min_notes))]
+        if resume:
+            cmd.append("--resume")
+        else:
+            cmd.append("--no-resume")
+        # Windows: create a new process group so .terminate() can also tear
+        # down any helpers the fetcher may eventually shell out to. The
+        # flag is a no-op on POSIX.
+        kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                      text=True, bufsize=1, encoding="utf-8", errors="replace")
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        self.proc = subprocess.Popen(cmd, cwd=str(ROOT), **kwargs)
+        self._reader = threading.Thread(target=self._pump, daemon=True)
+        self._reader.start()
+
+    def stop(self, timeout: float = 5.0):
+        if not self.is_running():
+            return
+        with self._lock:
+            self.was_stopped = True
+            _push_log(self.log, "[ui] stop requested, terminating…")
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        self._finalize()
+
+    def _pump(self):
+        assert self.proc and self.proc.stdout
+        for line in self.proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            with self._lock:
+                _push_log(self.log, line)
+                self._parse(line)
+        self._finalize()
+
+    def _parse(self, line: str):
+        # DONE first — same pattern as BuildRunner: the trailing summary is
+        # authoritative, so it overrides per-line counters if both arrive.
+        m = RE_FETCH_DONE.search(line)
+        if m:
+            self.ok = int(m.group(1))
+            self.fail = int(m.group(2))
+        else:
+            m = RE_FETCH_OK.search(line)
+            if m:
+                self.ok = max(self.ok, int(m.group(1)))
+                return
+            m = RE_FETCH_FAIL.search(line)
+            if m:
+                self.fail += 1
+        m = RE_FETCH_MANIFEST.search(line)
+        if m:
+            self.manifest = m.group(1).strip()
+        m = RE_FETCH_SEED.search(line)
+        if m:
+            # ``types`` and ``maxSongs`` are echoed back; keep max_songs in sync
+            # in case the caller (re)started with a different target.
+            try:
+                self.max_songs = int(m.group(2))
+            except (TypeError, ValueError):
+                pass
+
+    def _finalize(self):
+        rc = self.proc.returncode if self.proc else -1
+        with self._lock:
+            if self.was_stopped:
+                self.status = "stopped"
+            elif rc == 0:
+                self.status = "done"
+            else:
+                self.status = "failed"
+            _push_log(self.log, f"[ui] exited with code {rc}")
+        self.proc = None
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {"status": self.status, "ok": self.ok, "fail": self.fail,
+                    "manifest": self.manifest, "max_songs": self.max_songs,
+                    "log_tail": self.log[-50:], "running": self.is_running()}
+
+
+FETCHER = FetchRunner()
+
+
 # --- End-to-end pipeline runner ----------------------------------------------
 # Chains BUILDER + RUNNER(stage1) + RUNNER(stage2) sequentially in one
 # background thread. Reuses the existing runners so the user still gets the
@@ -417,7 +569,7 @@ class PipelineRunner:
             args1 = ["--epochs", str(int(epochs1)), "--data", out_dir,
                      "--device", device, "--lr", str(float(lr1)),
                      "--steps", str(int(steps1)), "--bs", str(int(bs1)),
-                     "--hid", "384", "--demb", "16"]
+                     "--hid", "256", "--demb", "16"]
             with self._lock:
                 _push_log(self.log, f"[pipeline] step 2/3 — stage1: python -u models/stage1.py {' '.join(args1)}")
             RUNNER.start("stage1", args1)
@@ -433,8 +585,8 @@ class PipelineRunner:
                 self.step = "stage2"; self.step_idx = 2
             args2 = ["--epochs", str(int(epochs2)), "--data", out_dir,
                      "--device", device, "--lr", str(float(lr2)),
-                     "--hid", "384", "--layers", "3", "--bs", "16",
-                     "--ctx-radius", "6", "--demb", "16"]
+                     "--hid", "256", "--layers", "2", "--bs", "8",
+                     "--ctx-radius", "6", "--demb", "16", "--max-len", "4096"]
             if ckpt1:
                 args2 += ["--resume", str(Path(ckpt1))]
                 with self._lock:
@@ -520,6 +672,31 @@ def _format_build_status(snap: dict) -> str:
     stopped = f"### ⏹ Stopped at {snap['ok']} ok / {snap['fail']} fail"
     out = snap.get("last_out") or ""
     footer = f"**Output folder:** `{out}`" if out else ""
+    if status == "stopped":
+        return stopped + (("\n" + footer) if footer and status != "idle" else "")
+    return _format_status_block(
+        status, running=running, done=done, failed=failed,
+        idle="### ⚪ Idle", footer=footer,
+    )
+
+
+def _format_fetch_status(snap: dict) -> str:
+    """Format a one-line status for the BeatLeader fetch zone.
+
+    Mirrors ``_format_build_status`` — same running/done/failed/stopped/idle
+    phrasing, with an extra ``target`` in the running line and a ``manifest``
+    footer that names the on-disk _index.sqlite so the user can re-use it
+    with ``--out`` next run.
+    """
+    status = snap["status"]
+    target = snap.get("max_songs") or 0
+    running = (f"### 🟡 Fetching community maps… "
+               f"({snap['ok']} ok / {snap['fail']} fail, target {target})")
+    done = f"### ✅ Fetch done — {snap['ok']} ok, {snap['fail']} failed"
+    failed = f"### ❌ Fetch failed at {snap['ok']} ok / {snap['fail']} fail"
+    stopped = f"### ⏹ Stopped at {snap['ok']} ok / {snap['fail']} fail"
+    manifest = snap.get("manifest") or ""
+    footer = f"**Manifest:** `{manifest}`" if manifest else ""
     if status == "stopped":
         return stopped + (("\n" + footer) if footer and status != "idle" else "")
     return _format_status_block(
@@ -661,10 +838,10 @@ def start_click(mode: str, stage: str, data_dir: str, epochs: int,
             "--device", device, "--lr", str(float(lr))]
     if stage == "stage1":
         args += ["--steps", str(int(steps)), "--bs", str(int(bs)),
-                 "--hid", "384", "--demb", "16"]
-    else:  # stage2 — packed-sequence mode with the scaled architecture defaults
-        args += ["--hid", "384", "--layers", "3", "--bs", "16",
-                 "--ctx-radius", "6", "--demb", "16"]
+                 "--hid", "256", "--demb", "16"]
+    else:  # stage2 — packed-sequence mode with the scaled 3060 architecture defaults
+        args += ["--hid", "256", "--layers", "2", "--bs", "8",
+                 "--ctx-radius", "6", "--demb", "16", "--max-len", "4096"]
     if mode == "Fine-tune":
         if not resume or not Path(resume).is_file():
             return (*_err("Fine-tune needs a valid `--resume` path to a .pt"), "",
@@ -720,20 +897,65 @@ def build_stop_click():
     return (_format_build_status(snap), "\n".join(snap["log_tail"]))
 
 
+def fetch_click(out_dir: str, max_songs: int, types, min_stars: float,
+                min_notes: int, resume: bool):
+    """Spawn ``scripts/fetch_community_maps.py`` as a child process.
+
+    ``types`` arrives from a ``gr.CheckboxGroup`` as a list (or from an
+    older Gradio as a single string) — we coerce it to the comma-separated
+    form ``--types`` accepts.
+    """
+    if FETCHER.is_running():
+        snap = FETCHER.snapshot()
+        return (_format_fetch_status(snap), "\n".join(snap["log_tail"]))
+    if not (out_dir or "").strip():
+        return _err("Output folder is empty — this is where downloaded maps "
+                    "land; point it at e.g. `data/community_maps`")
+    try:
+        n = int(max_songs)
+    except (TypeError, ValueError):
+        return _err("Max songs must be a positive integer")
+    if n <= 0:
+        return _err("Max songs must be > 0")
+    if isinstance(types, (list, tuple)):
+        types_str = ",".join(t for t in types if t)
+    else:
+        types_str = (str(types) if types else "ranked")
+    if not types_str:
+        types_str = "ranked"
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        FETCHER.start(out_dir, n, types_str,
+                      float(min_stars or 0), int(min_notes or 0), bool(resume))
+    except RuntimeError as e:
+        return _err(f"Failed to start fetch: {e}")
+    snap = FETCHER.snapshot()
+    return (_format_fetch_status(snap), "\n".join(snap["log_tail"]))
+
+
+def fetch_stop_click():
+    FETCHER.stop()
+    snap = FETCHER.snapshot()
+    return (_format_fetch_status(snap), "\n".join(snap["log_tail"]))
+
+
 def refresh_handlers() -> dict:
-    """Snapshot all three runners for the Gradio Timer (single tick drives both tabs)."""
+    """Snapshot all four runners for the Gradio Timer (single tick drives both tabs)."""
     r = RUNNER.snapshot()
     b = BUILDER.snapshot()
     p = PIPELINE.snapshot()
+    f = FETCHER.snapshot()
     return {
-        "status_value":      _format_status(r),
-        "log_value":         "\n".join(r["log_tail"]),
-        "plot_value":        _metrics_to_plot(r["metrics"], r["stage"]),
-        "colour_value":      _format_colour(r["colour"]),
-        "build_status_value": _format_build_status(b),
-        "build_log_value":    "\n".join(b["log_tail"]),
+        "status_value":          _format_status(r),
+        "log_value":             "\n".join(r["log_tail"]),
+        "plot_value":            _metrics_to_plot(r["metrics"], r["stage"]),
+        "colour_value":          _format_colour(r["colour"]),
+        "build_status_value":    _format_build_status(b),
+        "build_log_value":       "\n".join(b["log_tail"]),
         "pipeline_status_value": _format_pipeline_status(p),
         "pipeline_log_value":    "\n".join(p["log_tail"]),
+        "fetch_status_value":    _format_fetch_status(f),
+        "fetch_log_value":       "\n".join(f["log_tail"]),
     }
 
 
@@ -761,10 +983,12 @@ RECOMMENDATIONS_SHORT = """
 def build_train_tab() -> dict:
     """Build the Train tab. The block is appended to the existing app.
 
-    Layout — one screen, one button:
-      • Dataset   — where bundles live, where to put the built dataset, Build button
-      • Train     — mode radio (Cold / Fine-tune / Pipeline) + the few fields
-                    that change per mode + Start/Stop + live status/log/plot/colour
+    Layout — flat single-screen, three zones separated by ``<hr>``:
+      • 📦 Dataset preparation — build (raw → built dataset) + BeatLeader fetch
+      • 🧠 Train               — mode radio + per-mode fields + Start/Stop +
+                                  live status / log
+      • 📈 Metrics             — line plot + colour balance summary
+      • 📖 Recommendations    — static tips at the bottom (no longer an Accordion)
 
     Returns a dict of named handles; the Timer in app.py reads them on every tick.
     """
@@ -786,86 +1010,113 @@ def build_train_tab() -> dict:
         "Чекпойнты сохраняются с timestamp-бэкапом в `models/_ckpt/`.\n\n"
         "**Dataset path** — папка **уже собранного** датасета (в каждой подпапке "
         "`mel.npy` + `<Difficulty>.json`). Если у тебя только сырые бандлы — "
-        "сначала собери их ниже в секции «Dataset»."
+        "сначала собери их ниже в зоне «Dataset»."
     )
 
-    # ---------------- Dataset section ---------------------------------------
-    with gr.Accordion("📦 Dataset (raw bundles → built dataset)", open=False):
-        with gr.Row():
-            with gr.Column():
-                d_raw = gr.Textbox(label="Raw bundles folder(s)",
-                                   placeholder="BeatmapLevelsData   |   D:/maps/raw",
+    # ============ Zone 1: Dataset preparation =============================
+    gr.HTML("<hr>")
+    gr.Markdown("### 📦 Dataset preparation\n"
+                "Raw bundles → built dataset, **or** fetch quality-filtered "
+                "community maps from BeatLeader.")
+    with gr.Row():
+        with gr.Column():
+            gr.Markdown("**Build from raw bundles**")
+            d_raw = gr.Textbox(label="Raw bundles folder(s)",
+                               placeholder="BeatmapLevelsData   |   D:/maps/raw",
+                               value="BeatmapLevelsData")
+            d_out = gr.Textbox(label="Built-dataset output folder",
+                               placeholder="dataset",
+                               value="dataset")
+            d_force = gr.Checkbox(value=False, label="Force rebuild (recompute mel.npy)")
+            with gr.Row():
+                d_build = gr.Button("Build dataset", variant="primary")
+                d_stop = gr.Button("Stop", variant="stop")
+
+            gr.Markdown("**🌐 Fetch from BeatLeader (community maps)**")
+            f_max = gr.Number(value=500, label="Max songs to fetch", precision=0)
+            f_types = gr.CheckboxGroup(
+                ["ranked", "qualified", "nominated"],
+                value=["ranked"], label="Leaderboard types")
+            f_stars = gr.Number(value=0, label="Min stars", precision=1)
+            f_notes = gr.Number(value=30, label="Min notes", precision=0)
+            f_resume = gr.Checkbox(value=True, label="Resume from existing manifest")
+            with gr.Row():
+                f_fetch = gr.Button("Fetch community maps", variant="primary")
+                f_stop = gr.Button("Stop fetch", variant="stop")
+
+        with gr.Column():
+            build_status = gr.Markdown(_format_build_status(BUILDER.snapshot()))
+            build_log = gr.Textbox(label="Build log (last 50 lines)", lines=8,
+                                   max_lines=8, autoscroll=True, interactive=False,
+                                   value="\n".join(BUILDER.snapshot()["log_tail"]))
+            fetch_status = gr.Markdown(_format_fetch_status(FETCHER.snapshot()))
+            fetch_log = gr.Textbox(label="Fetch log (last 50 lines)", lines=8,
+                                   max_lines=8, autoscroll=True, interactive=False,
+                                   value="\n".join(FETCHER.snapshot()["log_tail"]))
+
+    d_build.click(build_click, [d_raw, d_out, d_force],
+                  [build_status, build_log])
+    d_stop.click(build_stop_click, outputs=[build_status, build_log])
+    f_fetch.click(fetch_click,
+                  [d_out, f_max, f_types, f_stars, f_notes, f_resume],
+                  [fetch_status, fetch_log])
+    f_stop.click(fetch_stop_click, outputs=[fetch_status, fetch_log])
+
+    # ============ Zone 2: Train ===========================================
+    gr.HTML("<hr>")
+    gr.Markdown("### 🧠 Train")
+    with gr.Row():
+        with gr.Column():
+            mode = gr.Radio(MODES, value="Cold start", label="Mode")
+            # Pipeline-specific: raw bundles + output + per-stage epochs + LRs
+            with gr.Group(visible=False) as p_grp:
+                p_raw = gr.Textbox(label="Raw bundles folder(s) (Pipeline mode)",
+                                   placeholder="BeatmapLevelsData",
                                    value="BeatmapLevelsData")
-                d_out = gr.Textbox(label="Output (built dataset) folder",
-                                   placeholder="dataset",
-                                   value="dataset")
-                d_force = gr.Checkbox(value=False, label="Force rebuild (recompute mel.npy)")
+                p_force = gr.Checkbox(value=False,
+                                      label="Force rebuild (recompute mel.npy)")
                 with gr.Row():
-                    d_build = gr.Button("Build dataset", variant="primary")
-                    d_stop = gr.Button("Stop", variant="stop")
-            with gr.Column():
-                build_status = gr.Markdown(_format_build_status(BUILDER.snapshot()))
-                build_log = gr.Textbox(label="Build log (last 50 lines)", lines=8,
-                                       max_lines=8, autoscroll=True, interactive=False,
-                                       value="\n".join(BUILDER.snapshot()["log_tail"]))
-        d_build.click(build_click, [d_raw, d_out, d_force],
-                      [build_status, build_log])
-        d_stop.click(build_stop_click, outputs=[build_status, build_log])
-
-    # ---------------- Train section -----------------------------------------
-    with gr.Accordion("🧠 Train (Cold start / Fine-tune / Pipeline)", open=True):
-        with gr.Row():
-            with gr.Column():
-                mode = gr.Radio(MODES, value="Cold start", label="Mode")
-                # Pipeline-specific: raw bundles + output + per-stage epochs + LRs
-                with gr.Group(visible=False) as p_grp:
-                    p_raw = gr.Textbox(label="Raw bundles folder(s) (Pipeline mode)",
-                                       placeholder="BeatmapLevelsData",
-                                       value="BeatmapLevelsData")
-                    p_force = gr.Checkbox(value=False,
-                                          label="Force rebuild (recompute mel.npy)")
-                    with gr.Row():
-                        p_epochs1 = gr.Slider(1, 200, value=50, step=1, label="Stage1 epochs")
-                        p_epochs2 = gr.Slider(1, 200, value=50, step=1, label="Stage2 epochs")
-                    with gr.Row():
-                        p_lr1 = gr.Number(value=1e-3, label="LR stage1", precision=4)
-                        p_lr2 = gr.Number(value=1e-3, label="LR stage2", precision=4)
-                # Single-stage fields (Cold start / Fine-tune)
-                with gr.Group() as s_grp:
-                    data_dir = gr.Textbox(
-                        label="Dataset path (built dataset: mel.npy + *.json per song)",
-                        placeholder="dataset   |   C:/data/my_dataset",
-                        value="dataset")
-                    stage = gr.Radio(["stage1", "stage2"], value="stage1", label="Stage")
-                    epochs = gr.Slider(1, 200, value=50, step=1, label="Epochs")
-                    with gr.Row():
-                        steps = gr.Slider(4, 400, value=200, step=4, label="Steps/epoch (stage1)")
-                        bs = gr.Slider(2, 128, value=64, step=2, label="Batch size (stage1)")
-                    lr = gr.Number(value=1e-3, label="Learning rate", precision=4)
-                    resume = gr.Textbox(label="Resume .pt path (Fine-tune only)",
-                                        placeholder="models/_ckpt/stage1.latest.pt")
-                device = gr.Radio(["cpu", "cuda"], value=DEFAULT_DEVICE, label="Device")
+                    p_epochs1 = gr.Slider(1, 200, value=50, step=1, label="Stage1 epochs")
+                    p_epochs2 = gr.Slider(1, 200, value=50, step=1, label="Stage2 epochs")
                 with gr.Row():
-                    go = gr.Button("Start", variant="primary")
-                    stop = gr.Button("Stop", variant="stop")
+                    p_lr1 = gr.Number(value=1e-3, label="LR stage1", precision=4)
+                    p_lr2 = gr.Number(value=1e-3, label="LR stage2", precision=4)
+            # Single-stage fields (Cold start / Fine-tune)
+            with gr.Group() as s_grp:
+                data_dir = gr.Textbox(
+                    label="Dataset path (built dataset: mel.npy + *.json per song)",
+                    placeholder="dataset   |   C:/data/my_dataset",
+                    value="dataset")
+                stage = gr.Radio(["stage1", "stage2"], value="stage1", label="Stage")
+                epochs = gr.Slider(1, 200, value=50, step=1, label="Epochs")
+                with gr.Row():
+                    steps = gr.Slider(4, 400, value=200, step=4, label="Steps/epoch (stage1)")
+                    bs = gr.Slider(2, 128, value=64, step=2, label="Batch size (stage1)")
+                lr = gr.Number(value=1e-3, label="Learning rate", precision=4)
+                resume = gr.Textbox(label="Resume .pt path (Fine-tune only)",
+                                    placeholder="models/_ckpt/stage1.latest.pt")
+            device = gr.Radio(["cpu", "cuda"], value=DEFAULT_DEVICE, label="Device")
+            with gr.Row():
+                go = gr.Button("Start", variant="primary")
+                stop = gr.Button("Stop", variant="stop")
 
-            with gr.Column():
-                status = gr.Markdown(_format_status(initial_snap))
-                with gr.Tabs():
-                    with gr.Tab("Live log"):
-                        log = gr.Textbox(label="Live log (last 50 lines)", lines=18,
-                                         max_lines=18, autoscroll=True, interactive=False,
-                                         value="\n".join(initial_snap["log_tail"]))
-                    with gr.Tab("Metrics"):
-                        plot = gr.LinePlot(
-                            x="epoch", y="value", color="metric",
-                            title="Metrics per epoch", x_title="epoch", y_title="value",
-                            value=_metrics_to_plot(initial_snap["metrics"],
-                                                  initial_snap["stage"]))
-                colour = gr.Markdown(_format_colour(initial_snap["colour"]))
+        with gr.Column():
+            status = gr.Markdown(_format_status(initial_snap))
+            log = gr.Textbox(label="Live log (last 50 lines)", lines=18,
+                             max_lines=18, autoscroll=True, interactive=False,
+                             value="\n".join(initial_snap["log_tail"]))
 
-    with gr.Accordion("📖 Recommendations", open=False):
-        gr.Markdown(RECOMMENDATIONS_SHORT)
+    # ============ Zone 3: Metrics =========================================
+    gr.HTML("<hr>")
+    gr.Markdown("### 📈 Metrics")
+    plot = gr.LinePlot(
+        x="epoch", y="value", color="metric",
+        title="Metrics per epoch", x_title="epoch", y_title="value",
+        value=_metrics_to_plot(initial_snap["metrics"], initial_snap["stage"]))
+    colour = gr.Markdown(_format_colour(initial_snap["colour"]))
+
+    gr.HTML("<hr>")
+    gr.Markdown(RECOMMENDATIONS_SHORT)
 
     # --- visibility: switch which input group is shown based on mode ---------
     def _toggle_group(mode_value: str):
@@ -881,6 +1132,12 @@ def build_train_tab() -> dict:
     stop.click(stop_click, outputs=[status, log, plot, colour])
 
     return {
-        "status": status, "log": log, "plot": plot, "colour": colour,
-        "build_status": build_status, "build_log": build_log,
+        "status":       status,
+        "log":          log,
+        "plot":         plot,
+        "colour":       colour,
+        "build_status": build_status,
+        "build_log":    build_log,
+        "fetch_status": fetch_status,
+        "fetch_log":    fetch_log,
     }

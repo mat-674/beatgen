@@ -6,3 +6,4 @@ librosa
 soundfile
 UnityPy
 gradio
+tqdm>=4.65

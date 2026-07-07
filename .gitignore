@@ -6,6 +6,7 @@ out/
 *.log
 nohup.out
 .claude/
+.gradio/
 
 # input content — supply your own, never committed
 BeatmapLevelsData/

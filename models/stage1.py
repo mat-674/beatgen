@@ -16,12 +16,14 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features.audio import time_to_frame  # noqa: E402
 from features.audio import N_MELS  # noqa: E402
 from models.common import (MelCache, N_DIFF, list_beatmaps, load_canonical,  # noqa: E402
                           save_with_backup, check_hparams, try_compile)
+from utils.progress import epoch_progress, inner_step_bar, should_use_tqdm  # noqa: E402
 
 CROP = 1024
 CKPT = Path("models/_ckpt/stage1.pt")
@@ -132,6 +134,10 @@ def main():
                     help="warm-start from a .pt (same dict format as save_with_backup)")
     ap.add_argument("--out-dir", type=Path, default=CKPT.parent,
                     help="where to write <name>.latest.pt and <name>.bak-<UTC>.pt")
+    ap.add_argument("--bar", choices=("auto", "on", "off"), default="auto",
+                    help="tqdm progress bar policy (default: auto — on for TTY, "
+                         "off for pipe). The [stage1] ep ... loss line is always "
+                         "printed regardless of --bar, so app_train.py can parse it.")
     args = ap.parse_args()
     device = args.device
     rng = np.random.default_rng()
@@ -212,59 +218,74 @@ def main():
     EARLY_STOP_PATIENCE_EVALS = 3
     no_improve = 0
 
-    for ep in range(1, args.epochs + 1):
-        model.train(); tot_loss = 0.0
-        for _ in range(args.steps):
-            mel, diff, lab = sample_batch(train, labels, cache, args.bs, device, rng)
-            opt.zero_grad()
-            if use_amp:
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = model(mel, diff)
-                loss = lossf(logits, lab)
-            else:
-                loss = lossf(model(mel, diff), lab)
-            loss.backward(); opt.step()
-            tot_loss += loss.item()
-        if ep % 5 == 0 or ep == args.epochs:
-            p, r, f1 = evaluate(model, val, labels, cache, device)
-            # best.pt: only overwrite on strict improvement so it never regresses.
-            # When the model is compiled, state_dict() walks through `_orig_mod`.
-            state = model.state_dict() if not (compiled and hasattr(model, "_orig_mod")) \
-                else model._orig_mod.state_dict()
-            if f1 > best_f1:
-                best_f1 = f1
-                no_improve = 0
-                best_path = args.out_dir / "stage1.best.pt"
-                tmp = best_path.with_suffix(".tmp.pt")
-                torch.save({"model": state,
-                            "mean": cache.mean, "std": cache.std,
-                            "hparams": {"hid": args.hid, "demb": args.demb, "crop": CROP}},
-                           tmp)
-                os.replace(tmp, best_path)
-                best_tag = f" best F1 {f1:.3f} -> {best_path}"
-                # Mirror best -> legacy stage1.pt so callers that hardcode that
-                # path load the validated-best weights, not the latest-epoch
-                # ones (which may be overfit and worse). Cheap: copy not save.
-                shutil.copy2(best_path, CKPT)
-            else:
-                no_improve += 1
-                best_tag = f" (best F1 {best_f1:.3f}, no improve {no_improve}/{EARLY_STOP_PATIENCE_EVALS})"
-                if no_improve >= EARLY_STOP_PATIENCE_EVALS:
-                    print(f"[stage1] ep {ep:3d} loss {tot_loss/args.steps:.4f} | "
-                          f"val P {p:.3f} R {r:.3f} F1 {f1:.3f}{best_tag}",
-                          flush=True)
-                    print(f"[stage1] early stop: no F1 improvement for "
-                          f"{EARLY_STOP_PATIENCE_EVALS * 5} epochs", flush=True)
-                    break
-            print(f"[stage1] ep {ep:3d} loss {tot_loss/args.steps:.4f} | "
-                  f"val P {p:.3f} R {r:.3f} F1 {f1:.3f}{best_tag}", flush=True)
-            latest = save_with_backup(
-                {"model": state, "mean": cache.mean, "std": cache.std,
-                 "hparams": {"hid": args.hid, "demb": args.demb, "crop": CROP}},
-                args.out_dir, "stage1",
-            )
-            print(f"[stage1] saved -> {latest}", flush=True)
+    # When the bar is on, the inner step bar (position=1) advances under the
+    # outer epoch bar (position=0). The byte-identical `[stage1] ep ...` lines
+    # are routed through ``ebar.write`` so the regex parsers in app_train.py
+    # keep matching — ``tqdm.write`` is just a thread-safe print between
+    # refreshes.
+    with epoch_progress(args.epochs, "stage1", explicit=args.bar) as ebar:
+        for ep in range(1, args.epochs + 1):
+            model.train(); tot_loss = 0.0
+            with inner_step_bar(args.steps, desc="step",
+                                explicit=args.bar, position=1) as sbar:
+                for _ in range(args.steps):
+                    mel, diff, lab = sample_batch(train, labels, cache, args.bs, device, rng)
+                    opt.zero_grad()
+                    if use_amp:
+                        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            logits = model(mel, diff)
+                        loss = lossf(logits, lab)
+                    else:
+                        loss = lossf(model(mel, diff), lab)
+                    loss.backward(); opt.step()
+                    tot_loss += loss.item()
+                    if sbar.n % 20 == 0:
+                        sbar.set_postfix(step_loss=loss.item())
+                    sbar.update(1)
+            if ep % 5 == 0 or ep == args.epochs:
+                p, r, f1 = evaluate(model, val, labels, cache, device)
+                # best.pt: only overwrite on strict improvement so it never regresses.
+                # When the model is compiled, state_dict() walks through `_orig_mod`.
+                state = model.state_dict() if not (compiled and hasattr(model, "_orig_mod")) \
+                    else model._orig_mod.state_dict()
+                if f1 > best_f1:
+                    best_f1 = f1
+                    no_improve = 0
+                    best_path = args.out_dir / "stage1.best.pt"
+                    tmp = best_path.with_suffix(".tmp.pt")
+                    torch.save({"model": state,
+                                "mean": cache.mean, "std": cache.std,
+                                "hparams": {"hid": args.hid, "demb": args.demb, "crop": CROP}},
+                               tmp)
+                    os.replace(tmp, best_path)
+                    best_tag = f" best F1 {f1:.3f} -> {best_path}"
+                    # Mirror best -> legacy stage1.pt so callers that hardcode that
+                    # path load the validated-best weights, not the latest-epoch
+                    # ones (which may be overfit and worse). Cheap: copy not save.
+                    shutil.copy2(best_path, CKPT)
+                else:
+                    no_improve += 1
+                    best_tag = f" (best F1 {best_f1:.3f}, no improve {no_improve}/{EARLY_STOP_PATIENCE_EVALS})"
+                    if no_improve >= EARLY_STOP_PATIENCE_EVALS:
+                        ebar.write(f"[stage1] ep {ep:3d} loss {tot_loss/args.steps:.4f} | "
+                                   f"val P {p:.3f} R {r:.3f} F1 {f1:.3f}{best_tag}")
+                        ebar.write(f"[stage1] early stop: no F1 improvement for "
+                                   f"{EARLY_STOP_PATIENCE_EVALS * 5} epochs")
+                        break
+                ebar.write(f"[stage1] ep {ep:3d} loss {tot_loss/args.steps:.4f} | "
+                           f"val P {p:.3f} R {r:.3f} F1 {f1:.3f}{best_tag}")
+                ebar.set_postfix(loss=tot_loss / args.steps, P=p, R=r, F1=f1,
+                                 lr=opt.param_groups[0]["lr"])
+                ebar.update(1)
+                latest = save_with_backup(
+                    {"model": state, "mean": cache.mean, "std": cache.std,
+                     "hparams": {"hid": args.hid, "demb": args.demb, "crop": CROP}},
+                    args.out_dir, "stage1",
+                )
+                ebar.write(f"[stage1] saved -> {latest}")
 
+    # Final summary lives OUTSIDE the with-block so the bar has already
+    # closed — tqdm can't print to a closed bar cleanly.
     print(f"[stage1] done -> {args.out_dir / 'stage1.latest.pt'} "
           f"(best F1 {best_f1:.3f} -> {args.out_dir / 'stage1.best.pt'})", flush=True)
 

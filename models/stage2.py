@@ -20,11 +20,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from features.audio import N_MELS, time_to_frame  # noqa: E402
 from models.common import (MelCache, N_DIFF, list_beatmaps, load_canonical,  # noqa: E402
                           save_with_backup, check_hparams, try_compile)
+from utils.progress import epoch_progress, inner_step_bar, should_use_tqdm  # noqa: E402
 
 CKPT = Path("models/_ckpt/stage2.pt")
 
@@ -298,6 +300,16 @@ def main():
                     help="warm-start from a .pt (same dict format as save_with_backup)")
     ap.add_argument("--out-dir", type=Path, default=CKPT.parent,
                     help="where to write <name>.latest.pt and <name>.bak-<UTC>.pt")
+    ap.add_argument("--bar", choices=("auto", "on", "off"), default="auto",
+                    help="tqdm progress bar policy (default: auto — on for TTY, "
+                         "off for pipe). The [stage2] ep ... loss line is always "
+                         "printed regardless of --bar, so app_train.py can parse it.")
+    ap.add_argument("--max-len", type=int, default=4096,
+                    help="cap sequence length (in frames) used during training. "
+                         "Sequences longer than this are skipped; sequences in the "
+                         "same packed bucket are length-sorted so L_max <= max-len. "
+                         "Set to 0 to disable (NOT recommended on GPUs with <=12 GB "
+                         "VRAM — packed GRU activations scale with L_max * B * hid).")
     args = ap.parse_args()
     device = args.device
     rng = np.random.default_rng()
@@ -315,6 +327,27 @@ def main():
     tr_seq = build_sequences(train, cache)
     va_seq = build_sequences(val, cache)
     print(f"[stage2] sequences: {len(tr_seq)} train / {len(va_seq)} val", flush=True)
+
+    # ---- max-len bucketize (VRAM safety on small GPUs) --------------------------
+    # We don't want a single 13k-frame song to blow the VRAM budget on the
+    # RTX 3060. With ``--max-len N`` we:
+    #   1. drop sequences longer than N (the lossless alternative would be
+    #      chunked sampling, which we don't need at this scale — long-tail
+    #      songs are <1% of the dataset),
+    #   2. length-sort everything else so the packed buckets have a bounded
+    #      L_max (already happens each epoch inside the loop, but we also
+    #      reorder the *flat list* so the outer tqdm total stays accurate).
+    if args.max_len > 0:
+        n_before = len(tr_seq)
+        tr_seq = [s for s in tr_seq if len(s["tgt"]) <= args.max_len]
+        n_dropped_tr = n_before - len(tr_seq)
+        n_before = len(va_seq)
+        va_seq = [s for s in va_seq if len(s["tgt"]) <= args.max_len]
+        n_dropped_va = n_before - len(va_seq)
+        if n_dropped_tr or n_dropped_va:
+            print(f"[stage2] max-len {args.max_len}: dropped {n_dropped_tr} train / "
+                  f"{n_dropped_va} val sequences (>max_len). Kept "
+                  f"{len(tr_seq)} train / {len(va_seq)} val.", flush=True)
 
     # colour balance -> per-colour pos_weight (mirrors Stage 1's onset pos_weight) +
     # a column histogram, so a future "all blue / one column" collapse is visible in logs.
@@ -379,72 +412,83 @@ def main():
     EARLY_STOP_PATIENCE_EVALS = 3
     no_improve = 0
 
-    for ep in range(1, args.epochs + 1):
-        model.train()
-        # Sort by length each epoch so each packed bucket has low padding waste.
-        order = sorted(range(len(tr_seq)), key=lambda i: len(tr_seq[i]["tgt"]))
-        tot = 0.0
-        n_loss = 0
-        i = 0
-        while i < len(order):
-            batch = [tr_seq[k] for k in order[i:i + args.bs]]
-            i += args.bs
-            ctx, prev, tgt, diff, lens = pack_batch(batch, device)
-            opt.zero_grad()
-            if use_amp:
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    out, _ = model(ctx, diff, prev)
-                # Loss stays fp32 — seq_loss already casts logits/target inside.
-                loss = seq_loss(out, tgt, device, pos_weight, lengths=lens)
-            else:
-                out, _ = model(ctx, diff, prev)
-                loss = seq_loss(out, tgt, device, pos_weight, lengths=lens)
-            loss.backward(); opt.step()
-            tot += loss.item(); n_loss += 1
-        if ep % 5 == 0 or ep == args.epochs:
-            acc = eval_presence(model, va_seq, device, bs=max(args.bs, 1))
-            bal = acc["bal_acc"]
-            # When compiled, the canonical state_dict lives behind `_orig_mod`.
-            state = (model._orig_mod.state_dict()
-                     if (compiled and hasattr(model, "_orig_mod"))
-                     else model.state_dict())
-            if bal > best_bal:
-                best_bal = bal
-                no_improve = 0
-                best_path = args.out_dir / "stage2.best.pt"
-                tmp = best_path.with_suffix(".tmp.pt")
-                torch.save({"model": state,
-                            "mean": cache.mean, "std": cache.std,
-                            "hparams": {"hid": args.hid, "layers": args.layers,
-                                        "demb": args.demb, "ctx_radius": args.ctx_radius}},
-                           tmp)
-                os.replace(tmp, best_path)
-                best_tag = f" best bal-acc {bal:.3f} -> {best_path}"
-                # Mirror best -> legacy stage2.pt so hardcoded-path callers
-                # load the validated-best model instead of the latest one
-                # (which is just the last-epoch weights and may be overfit).
-                shutil.copy2(best_path, CKPT)
-            else:
-                no_improve += 1
-                best_tag = f" (best bal-acc {best_bal:.3f}, no improve {no_improve}/{EARLY_STOP_PATIENCE_EVALS})"
-                if no_improve >= EARLY_STOP_PATIENCE_EVALS:
-                    print(f"[stage2] ep {ep:3d} loss {tot/max(1,n_loss):.4f} | "
-                          f"val note-acc {acc['note_acc']:.3f} bal-acc {bal:.3f}{best_tag}",
-                          flush=True)
-                    print(f"[stage2] early stop: no bal-acc improvement for "
-                          f"{EARLY_STOP_PATIENCE_EVALS * 5} epochs", flush=True)
-                    break
-            print(f"[stage2] ep {ep:3d} loss {tot/max(1,n_loss):.4f} | "
-                  f"val note-acc {acc['note_acc']:.3f} bal-acc {bal:.3f}{best_tag}",
-                  flush=True)
-            latest = save_with_backup(
-                {"model": state, "mean": cache.mean, "std": cache.std,
-                 "hparams": {"hid": args.hid, "layers": args.layers,
-                             "demb": args.demb, "ctx_radius": args.ctx_radius}},
-                args.out_dir, "stage2",
-            )
-            print(f"[stage2] saved -> {latest}", flush=True)
+    # Outer epoch bar + inner step bar (packed-bucket counter). All epoch-eval
+    # prints route through ``ebar.write`` so the byte-identical ``[stage2] ep``
+    # regex in app_train.py keeps matching.
+    with epoch_progress(args.epochs, "stage2", explicit=args.bar) as ebar:
+        for ep in range(1, args.epochs + 1):
+            model.train()
+            # Sort by length each epoch so each packed bucket has low padding waste.
+            order = sorted(range(len(tr_seq)), key=lambda i: len(tr_seq[i]["tgt"]))
+            tot = 0.0
+            n_loss = 0
+            n_steps = (len(order) + args.bs - 1) // args.bs
+            i = 0
+            with inner_step_bar(n_steps, desc="packed-bucket",
+                                explicit=args.bar, position=1) as sbar:
+                while i < len(order):
+                    batch = [tr_seq[k] for k in order[i:i + args.bs]]
+                    i += args.bs
+                    ctx, prev, tgt, diff, lens = pack_batch(batch, device)
+                    opt.zero_grad()
+                    if use_amp:
+                        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            out, _ = model(ctx, diff, prev)
+                        # Loss stays fp32 — seq_loss already casts logits/target inside.
+                        loss = seq_loss(out, tgt, device, pos_weight, lengths=lens)
+                    else:
+                        out, _ = model(ctx, diff, prev)
+                        loss = seq_loss(out, tgt, device, pos_weight, lengths=lens)
+                    loss.backward(); opt.step()
+                    tot += loss.item(); n_loss += 1
+                    sbar.update(1)
+            if ep % 5 == 0 or ep == args.epochs:
+                acc = eval_presence(model, va_seq, device, bs=max(args.bs, 1))
+                bal = acc["bal_acc"]
+                # When compiled, the canonical state_dict lives behind `_orig_mod`.
+                state = (model._orig_mod.state_dict()
+                         if (compiled and hasattr(model, "_orig_mod"))
+                         else model.state_dict())
+                if bal > best_bal:
+                    best_bal = bal
+                    no_improve = 0
+                    best_path = args.out_dir / "stage2.best.pt"
+                    tmp = best_path.with_suffix(".tmp.pt")
+                    torch.save({"model": state,
+                                "mean": cache.mean, "std": cache.std,
+                                "hparams": {"hid": args.hid, "layers": args.layers,
+                                            "demb": args.demb, "ctx_radius": args.ctx_radius}},
+                               tmp)
+                    os.replace(tmp, best_path)
+                    best_tag = f" best bal-acc {bal:.3f} -> {best_path}"
+                    # Mirror best -> legacy stage2.pt so hardcoded-path callers
+                    # load the validated-best model instead of the latest one
+                    # (which is just the last-epoch weights and may be overfit).
+                    shutil.copy2(best_path, CKPT)
+                else:
+                    no_improve += 1
+                    best_tag = f" (best bal-acc {best_bal:.3f}, no improve {no_improve}/{EARLY_STOP_PATIENCE_EVALS})"
+                    if no_improve >= EARLY_STOP_PATIENCE_EVALS:
+                        ebar.write(f"[stage2] ep {ep:3d} loss {tot/max(1,n_loss):.4f} | "
+                                   f"val note-acc {acc['note_acc']:.3f} bal-acc {bal:.3f}{best_tag}")
+                        ebar.write(f"[stage2] early stop: no bal-acc improvement for "
+                                   f"{EARLY_STOP_PATIENCE_EVALS * 5} epochs")
+                        break
+                ebar.write(f"[stage2] ep {ep:3d} loss {tot/max(1,n_loss):.4f} | "
+                           f"val note-acc {acc['note_acc']:.3f} bal-acc {bal:.3f}{best_tag}")
+                ebar.set_postfix(loss=tot / max(1, n_loss),
+                                 note_acc=acc["note_acc"], bal_acc=bal,
+                                 lr=opt.param_groups[0]["lr"])
+                ebar.update(1)
+                latest = save_with_backup(
+                    {"model": state, "mean": cache.mean, "std": cache.std,
+                     "hparams": {"hid": args.hid, "layers": args.layers,
+                                 "demb": args.demb, "ctx_radius": args.ctx_radius}},
+                    args.out_dir, "stage2",
+                )
+                ebar.write(f"[stage2] saved -> {latest}")
 
+    # Final summary lives outside the with-block — see stage1.py for why.
     print(f"[stage2] done -> {args.out_dir / 'stage2.latest.pt'} "
           f"(best bal-acc {best_bal:.3f} -> {args.out_dir / 'stage2.best.pt'})", flush=True)
 

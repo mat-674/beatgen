@@ -39,6 +39,12 @@ from extract.loaders import (  # noqa: E402
     normalize_difficulties,
     slugify,
 )
+from utils.progress import (  # noqa: E402
+    format_eta,
+    log_jsonl,
+    should_use_tqdm,
+    song_progress,
+)
 
 
 # Use unbuffered stdout everywhere so a single print() never sits in a buffer
@@ -50,8 +56,14 @@ except Exception:
 
 
 def _emit(msg: str) -> None:
-    """Single print helper — always flushes."""
+    """Single print helper — always flushes stdout AND mirrors to ``--log-file``.
+
+    The stdout line keeps the byte-identical shape the Gradio BuildRunner in
+    ``app_train.py:288-308`` parses, regardless of whether a tqdm bar is
+    active on stderr.
+    """
     print(msg, flush=True)
+    log_jsonl(LOG_FILE, {"event": "line", "msg": msg})
 
 
 def load_mono_22k(audio) -> np.ndarray:
@@ -215,14 +227,9 @@ def _summarise(result: dict, debug: bool, n_done: int, n_total: int) -> str:
     return f"[{result['status']}] {sid}"
 
 
-def _format_eta(done: int, total: int, elapsed: float) -> str:
-    if done == 0 or elapsed < 1.0:
-        return "ETA --:--"
-    rate = done / elapsed
-    left = max(0, total - done)
-    secs = left / rate
-    m, s = divmod(int(secs), 60)
-    return f"ETA {m:02d}:{s:02d}"
+# Module-level so _emit() can find the log-file destination without threading
+# it through every call signature. ``None`` is the safe default (no-op).
+LOG_FILE = None
 
 
 def main():
@@ -239,7 +246,13 @@ def main():
     ap.add_argument("--debug", action="store_true",
                     help="print per-task timing, worker PID, RSS, peak RSS at end")
     ap.add_argument("--heartbeat", type=float, default=3.0,
-                    help="main-loop heartbeat interval in seconds (default: 3.0)")
+                    help="main-loop heartbeat interval in seconds (default: 3.0). "
+                         "Only used when the tqdm bar is OFF (pipe run).")
+    ap.add_argument("--bar", choices=("auto", "on", "off"), default="auto",
+                    help="tqdm progress bar policy (default: auto — on for TTY, "
+                         "off for pipe)")
+    ap.add_argument("--log-file", type=Path, default=None,
+                    help="append per-event JSONL to this path (for telemetry)")
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -271,6 +284,12 @@ def main():
     n_done = 0
     _emit(f"[..] {n_total} levels, {args.jobs} workers, chunksize={args.chunksize}"
           + (", debug on" if args.debug else ""))
+    log_jsonl(args.log_file, {"event": "start", "n_total": n_total,
+                              "jobs": args.jobs, "chunksize": args.chunksize,
+                              "bar": args.bar})
+    # Expose to _emit() so every printed line is mirrored to the JSONL stream.
+    global LOG_FILE
+    LOG_FILE = args.log_file
 
     # Phase 2: parallel heavy work. imap_unordered yields as each task finishes;
     # a tiny background heartbeat thread proves the process is alive during long gaps.
@@ -295,22 +314,27 @@ def main():
     stop_evt = threading.Event()
     counts = {"ok": 0, "skip": 0, "empty": 0, "fail": 0}
     interrupted = False
+    use_bar = should_use_tqdm(args.bar)
 
-    def _heartbeat():
-        # Runs in a daemon thread. Reads shared counters, prints to stdout.
-        # The pool's imap_unordered is driven from the main thread; this thread
-        # is purely observational.
-        while not stop_evt.is_set():
-            stop_evt.wait(args.heartbeat)
-            if stop_evt.is_set():
-                return
-            now = time.perf_counter()
-            _emit(f"[..] {n_done}/{n_total} done ({counts['ok']} ok, {counts['skip']} skip, "
-                  f"{counts['empty']} empty, {counts['fail']} fail) "
-                  f"{_format_eta(n_done, n_total, now - started)}")
-
-    hb_thread = threading.Thread(target=_heartbeat, name="heartbeat", daemon=True)
-    hb_thread.start()
+    # The tqdm bar (when enabled) replaces the heartbeat thread entirely:
+    # it shows live n_done/total + postfix(ok/skip/empty/fail) on stderr and
+    # advances per task. For pipe runs we keep a throttled heartbeat thread
+    # so the user still sees global progress on stdout.
+    bar = song_progress(n_total, desc="build_dataset", explicit=args.bar) if use_bar else None
+    if not use_bar and args.heartbeat > 0:
+        def _heartbeat():
+            while not stop_evt.is_set():
+                stop_evt.wait(args.heartbeat)
+                if stop_evt.is_set():
+                    return
+                now = time.perf_counter()
+                _emit(f"[..] {n_done}/{n_total} done ({counts['ok']} ok, {counts['skip']} skip, "
+                      f"{counts['empty']} empty, {counts['fail']} fail) "
+                      f"{format_eta(n_done, n_total, now - started)}")
+        hb_thread = threading.Thread(target=_heartbeat, name="heartbeat", daemon=True)
+        hb_thread.start()
+    else:
+        hb_thread = None
 
     def _accumulate(result: dict) -> None:
         nonlocal n_done, peak_rss, ok, skip, empty, fail
@@ -328,8 +352,18 @@ def main():
         elif status == "fail":
             fail += 1; counts["fail"] += 1
         line = _summarise(result, args.debug, n_done, n_total)
-        tail = f"  {_format_eta(n_done, n_total, time.perf_counter() - started)}"
-        _emit(line + tail if status == "ok" else line)
+        tail = f"  {format_eta(n_done, n_total, time.perf_counter() - started)}"
+        full_line = line + tail if status == "ok" else line
+        if bar is not None:
+            bar.set_postfix(ok=counts["ok"], skip=counts["skip"],
+                            empty=counts["empty"], fail=counts["fail"],
+                            eta=format_eta(n_done, n_total, time.perf_counter() - started))
+            bar.update(1)
+            bar.write(full_line)
+        else:
+            _emit(full_line)
+        log_jsonl(args.log_file, {"event": "task", **result,
+                                  "n_done": n_done, "n_total": n_total})
         if args.debug and status == "fail" and result.get("tb"):
             _emit(result["tb"].rstrip())
 
@@ -338,7 +372,10 @@ def main():
             _accumulate(result)
     except KeyboardInterrupt:
         interrupted = True
-        _emit("\n[!] Ctrl+C received, terminating workers ...")
+        if bar is not None:
+            bar.write("\n[!] Ctrl+C received, terminating workers ...")
+        else:
+            _emit("\n[!] Ctrl+C received, terminating workers ...")
         # Stop the heartbeat thread ASAP so it doesn't keep printing after we exit.
         stop_evt.set()
         # Don't try to drain — workers may be in long mel/stft and we want out now.
@@ -347,13 +384,18 @@ def main():
             pool.terminate()
         except Exception:
             pass
-        try:
-            hb_thread.join(timeout=1.0)
-        except Exception:
-            pass
+        if hb_thread is not None:
+            try:
+                hb_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        if bar is not None:
+            bar.close()
         # Print the partial result and exit cleanly (don't re-raise — no traceback spam).
         (args.out / "index.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
         wall = time.perf_counter() - started
+        log_jsonl(args.log_file, {"event": "interrupt", "ok": ok, "skip": skip,
+                                  "empty": empty, "fail": fail, "wall": wall})
         _emit(f"\ninterrupted: {ok} ok, {skip} skip, {empty} empty, {fail} failed "
               f"after {wall:.1f}s -> {args.out}")
         return
@@ -367,21 +409,28 @@ def main():
     finally:
         stop_evt.set()
         if not interrupted:
-            try:
-                hb_thread.join(timeout=1.0)
-            except Exception:
-                pass
+            if hb_thread is not None:
+                try:
+                    hb_thread.join(timeout=1.0)
+                except Exception:
+                    pass
             try:
                 pool.close()
                 pool.join()
             except Exception:
                 pass
+        if bar is not None and not interrupted:
+            bar.close()
 
     (args.out / "index.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
     wall = time.perf_counter() - started
     tail = f", peak worker RSS={peak_rss:.0f}MB" if peak_rss > 0 else ""
-    _emit(f"\ndone: {ok} ok, {skip} skip, {empty} empty, {fail} failed "
-          f"in {wall:.1f}s -> {args.out}{tail}")
+    done_line = (f"\ndone: {ok} ok, {skip} skip, {empty} empty, {fail} failed "
+                 f"in {wall:.1f}s -> {args.out}{tail}")
+    log_jsonl(args.log_file, {"event": "done", "ok": ok, "skip": skip,
+                              "empty": empty, "fail": fail, "wall": wall,
+                              "peak_rss_mb": peak_rss})
+    _emit(done_line)
 
 
 if __name__ == "__main__":

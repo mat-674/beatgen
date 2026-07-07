@@ -95,6 +95,12 @@ Three steps turn raw content into trained models. Run them in order:
 Both stages default to **60 epochs** (up from the 65-song proof-of-life) to make use of the
 larger 326-song set; lower them for a quick smoke test.
 
+All three commands accept `--bar {auto,on,off}` and `--log-file PATH`. Default is `auto` —
+tqdm draws on a TTY, plain line log when piped. `build_dataset.py` also mirrors every
+`[ok]/[skip]/[fail]` event as JSONL to `--log-file` for telemetry. On GPUs with ≤12 GB
+VRAM (e.g. RTX 3060) pass `--max-len 4096` to `stage2.py` — songs longer than 4k frames
+skip this epoch and packed GRU buckets stay inside the 10 GB budget.
+
 ---
 
 ## 5. Community training data
@@ -189,6 +195,8 @@ Click *Generate map* for a downloadable `.zip` plus per-difficulty stats. The pa
 - `--seed` fix the RNG for reproducible note placement
 - `--bpm` override auto-detected tempo
 - `--device cpu|cuda`
+- `--bar {auto,on,off}` toggle the terminal progress bars (load → analyze → onset →
+  decode → pack). Default `auto` follows TTY detection.
 
 ### Play the result
 The output folder (or unzipped UI download) is a normal custom level:
@@ -265,36 +273,43 @@ The full base game + DLC OST (326 levels) is already wired in. To go beyond it:
 3. For real training, install the CUDA build (`python install.py --runtime cuda`) and train
    with more epochs; the scripts pick up the GPU automatically.
 
-### 7a. Scaled run (RTX-class GPU, 11× data)
+### 7a. Scaled run (RTX 3060 12 GB / 10 GB budget)
 
 When the dataset crosses a few thousand songs (OST + DLC + ranked maps from BeatLeader
 via `scripts/fetch_community_maps.py` landing in `data/community_maps/`), the original
 `hid=256, layers=2, bs=16, steps=80` defaults start to bottleneck capacity. The defaults
-in `app_train.py` already reflect the scaled configuration; you can also invoke the
-scripts directly. The figures below are what the gradio UI sends by default — copy
+in `app_train.py` already reflect the 3060-tuned configuration below; you can also invoke
+the scripts directly. These values are what the Gradio Train tab sends by default — copy
 them straight into the sliders.
+
+Verified via `scripts/vram_probe.py` on an RTX 3060 12 GB:
+- Stage 1 (`hid=256, bs=32`): **343 MB peak** (full budget headroom)
+- Stage 2 (`hid=256, layers=2, bs=8, max-len=4096`): **437 MB peak**
+- A hypothetical scaled-up `hid=384, layers=3, bs=16` also fits at ~1.5 GB, but leaves
+  no headroom for `torch.compile` + occasional long-tail buckets.
 
 **Stage 1 — TCN onsets**
 
-| | Default | Scaled |
+| | Default | Scaled 3060 |
 |---|---|---|
 | Epochs | 50 | 50 |
 | Steps/epoch | 200 | 200 |
-| Batch size | 64 | 64 |
-| Hid (TCN width) | 384 | 384 |
+| Batch size | 64 | **32** |
+| Hid (TCN width) | 384 | **256** |
 | LR | 1e-3 | 1e-3 |
 | bf16 autocast | on (CUDA) | on (CUDA) |
 | `torch.compile` | on (CUDA) | on (CUDA) |
 
 **Stage 2 — GRU notes**
 
-| | Default | Scaled |
+| | Default | Scaled 3060 |
 |---|---|---|
 | Epochs | 50 | 50 |
-| Packed batch size | 16 | 16 |
-| Hid (GRU width) | 384 | 384 |
-| Layers | 3 | 3 |
+| Packed batch size | 16 | **8** |
+| Hid (GRU width) | 384 | **256** |
+| Layers | 3 | **2** |
 | ctx_radius (frames) | 6 | 6 |
+| max-len (frames) | (none) | **4096** |
 | LR | 1e-3 | 1e-3 |
 | bf16 autocast | on (CUDA) | on (CUDA) |
 | `torch.compile` | on (CUDA) | on (CUDA) |
@@ -302,19 +317,57 @@ them straight into the sliders.
 The CLI equivalents (for debugging outside the UI):
 
 ```bash
-# Stage 1: ~2-3 h on RTX 4090, longer on 3060
-python -u models/stage1.py --epochs 50 --steps 200 --bs 64 --hid 384 \
+# Stage 1
+python -u models/stage1.py --epochs 50 --steps 200 --bs 32 --hid 256 \
     --data dataset
 
-# Stage 2: ~1-2 h on RTX 4090
-python -u models/stage2.py --epochs 50 --hid 384 --layers 3 --bs 16 \
-    --ctx-radius 6 --data dataset
+# Stage 2 — --max-len caps bucket L_max so the GRU activations stay
+# inside the 10 GB budget on RTX 3060-class cards
+python -u models/stage2.py --epochs 50 --hid 256 --layers 2 --bs 8 \
+    --max-len 4096 --ctx-radius 6 --data dataset
 ```
+
+For 24 GB+ cards (RTX 4090 / A5000) bump `--hid` back to 384, `--layers` to 3, `--bs` to
+64 / 16, and drop `--max-len` (or set it to 0 to disable). Probe first with
+`scripts/vram_probe.py --stage 2 --configs "hid=384,layers=3,bs=16,len=8192"`.
 
 Checkpoints now carry the architecture they were trained with in an `hparams` block
 (`hid`, `layers`, `demb`, `ctx_radius`, `crop`). `generate.py` reads it on load so
 the inference model shape always matches the trained one — no manual sync needed
 when you bump the defaults.
+
+### 7b. VRAM probing
+
+`scripts/vram_probe.py` measures the actual peak VRAM for any `(hid, bs, [layers], [len])`
+combo on your GPU. Each probe allocates a synthetic batch of the right shape, runs 3
+forward+backward steps under bf16 autocast (matching the trainer), and prints the peak
+allocation in MB plus an `OK / OVER` verdict against `--budget-mb` (default 10240 MB).
+
+```bash
+# Validate that a proposed config fits in the 10 GB budget before kicking
+# off a 50-epoch run.
+.venv/bin/python scripts/vram_probe.py --stage 1 \
+    --configs "hid=256,bs=32" "hid=384,bs=64"
+.venv/bin/python scripts/vram_probe.py --stage 2 \
+    --configs "hid=256,layers=2,bs=8,len=4096" \
+             "hid=384,layers=3,bs=16,len=4096"
+```
+
+Use this when porting to a new GPU tier — pick the (hid, bs) combo that prints `OK`
+with the largest headroom over your budget.
+
+### 7c. Reclaiming disk space from checkpoint backups
+
+Each training run leaves a timestamped `stage{N}.bak-<UTC>.pt` in `models/_ckpt/`
+(from `models.common.save_with_backup`). After a few weeks these accumulate to
+~1.5 GB for nothing — the active `.pt` / `.best.pt` / `.latest.pt` are the only
+files inference loads. `scripts/cleanup_checkpoints.py` keeps the 3 newest bak
+files per stage and deletes the rest:
+
+```bash
+python scripts/cleanup_checkpoints.py            # dry run
+python scripts/cleanup_checkpoints.py --apply    # actually delete
+```
 
 ---
 
